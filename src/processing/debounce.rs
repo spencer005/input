@@ -1,15 +1,15 @@
- use crate::events::InputEvent;
-use crate::state::Seat;
-use crate::backend::DeviceInfo;
-use super::{Filter, FilterResult};
-use smallvec::smallvec;
+use {
+    super::{Filter, FilterResult},
+    crate::{backend::DeviceInfo, events::InputEvent, state::Seat},
+    smallvec::smallvec,
+};
 
 /// Configuration for button/key debounce behavior.
 ///
 /// All timeouts are in microseconds. Set to 0 to disable that phase.
 /// `enabled: false` disables the filter entirely (zero-latency passthrough).
- #[derive(Debug, Clone, Copy)]
- pub struct DebounceConfig {
+#[derive(Debug, Clone, Copy)]
+pub struct DebounceConfig {
     /// Whether debounce is active at all. When false, all events pass through
     /// with no latency penalty.
     pub enabled: bool,
@@ -49,12 +49,14 @@ enum DebounceState {
 struct ButtonState {
     state: DebounceState,
     last_event_time: u64,
- }
- 
- impl Copy for ButtonState {}
- impl Clone for ButtonState {
-     fn clone(&self) -> Self { *self }
- }
+}
+
+impl Copy for ButtonState {}
+impl Clone for ButtonState {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 
 impl Default for ButtonState {
     fn default() -> Self {
@@ -81,9 +83,16 @@ impl ButtonDebounceFilter {
     /// Create a disabled filter that passes all events through with zero overhead.
     pub fn disabled() -> Self {
         Self {
-            config: DebounceConfig { enabled: false, ..Default::default() },
+            config: DebounceConfig {
+                enabled: false,
+                ..Default::default()
+            },
             buttons: [ButtonState::default(); 16],
         }
+    }
+
+    pub fn reset_runtime_state(&mut self) {
+        self.buttons = [ButtonState::default(); 16];
     }
 
     fn handle_event(&mut self, key: u32, pressed: bool, time_us: u64) -> Option<bool> {
@@ -99,6 +108,7 @@ impl ButtonDebounceFilter {
 
         let bounce_timeout = self.config.bounce_timeout_us;
         let spurious_timeout = self.config.spurious_timeout_us;
+        let elapsed = time_us.saturating_sub(state_obj.last_event_time);
 
         match old_state {
             DebounceState::Up => {
@@ -115,40 +125,40 @@ impl ButtonDebounceFilter {
             }
             DebounceState::DownWaiting => {
                 if !pressed {
-                    if time_us - state_obj.last_event_time < bounce_timeout {
+                    if elapsed < bounce_timeout {
                         state_obj.state = DebounceState::UpDelaying;
                     } else {
                         state_obj.state = DebounceState::UpDetectingSpurious;
                         emit = Some(false);
                     }
-                } else if time_us - state_obj.last_event_time >= bounce_timeout {
+                } else if elapsed >= bounce_timeout {
                     state_obj.state = DebounceState::Down;
                 }
             }
             DebounceState::UpDelaying => {
                 if pressed {
                     state_obj.state = DebounceState::DownWaiting;
-                } else if time_us - state_obj.last_event_time >= bounce_timeout {
+                } else if elapsed >= bounce_timeout {
                     state_obj.state = DebounceState::Up;
                     emit = Some(false);
                 }
             }
             DebounceState::UpDetectingSpurious => {
                 if pressed {
-                    if spurious_timeout > 0 && time_us - state_obj.last_event_time < spurious_timeout {
+                    if spurious_timeout > 0 && elapsed < spurious_timeout {
                         state_obj.state = DebounceState::DownDetectingSpurious;
                     } else {
                         state_obj.state = DebounceState::DownWaiting;
                         emit = Some(true);
                     }
-                } else if spurious_timeout > 0 && time_us - state_obj.last_event_time >= spurious_timeout {
+                } else if spurious_timeout > 0 && elapsed >= spurious_timeout {
                     state_obj.state = DebounceState::Up;
                 }
             }
             DebounceState::DownDetectingSpurious => {
                 if !pressed {
                     state_obj.state = DebounceState::UpDetectingSpurious;
-                } else if time_us - state_obj.last_event_time >= spurious_timeout {
+                } else if elapsed >= spurious_timeout {
                     state_obj.state = DebounceState::Down;
                     emit = Some(true);
                 }
@@ -161,20 +171,41 @@ impl ButtonDebounceFilter {
 }
 
 impl Filter for ButtonDebounceFilter {
-    fn process(&mut self, event: InputEvent, _seat: Option<&Seat>, _info: Option<DeviceInfo>) -> FilterResult {
+    fn process(
+        &mut self,
+        event: InputEvent,
+        _seat: Option<&Seat>,
+        _info: Option<DeviceInfo>,
+    ) -> FilterResult {
         match event {
-            InputEvent::PointerButton { device_index, time_us, button, pressed } => {
-                match self.handle_event(button, pressed, time_us) {
-                    Some(p) => smallvec![InputEvent::PointerButton { device_index, time_us, button, pressed: p }],
-                    None => smallvec![],
-                }
-            }
-            InputEvent::Key { device_index, time_us, key, pressed } => {
-                match self.handle_event(key, pressed, time_us) {
-                    Some(p) => smallvec![InputEvent::Key { device_index, time_us, key, pressed: p }],
-                    None => smallvec![],
-                }
-            }
+            InputEvent::PointerButton {
+                device_index,
+                time_us,
+                button,
+                pressed,
+            } => match self.handle_event(button, pressed, time_us) {
+                Some(p) => smallvec![InputEvent::PointerButton {
+                    device_index,
+                    time_us,
+                    button,
+                    pressed: p
+                }],
+                None => smallvec![],
+            },
+            InputEvent::Key {
+                device_index,
+                time_us,
+                key,
+                pressed,
+            } => match self.handle_event(key, pressed, time_us) {
+                Some(p) => smallvec![InputEvent::Key {
+                    device_index,
+                    time_us,
+                    key,
+                    pressed: p
+                }],
+                None => smallvec![],
+            },
             _ => smallvec![event],
         }
     }
@@ -182,8 +213,7 @@ impl Filter for ButtonDebounceFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::events::DevIndex;
+    use {super::*, crate::events::DevIndex};
 
     fn enabled_filter() -> ButtonDebounceFilter {
         ButtonDebounceFilter::new(DebounceConfig {
@@ -224,4 +254,3 @@ mod tests {
         assert!(f.handle_event(btn, false, 100_000).is_some());
     }
 }
-

@@ -8,11 +8,14 @@
 //!
 //! Run with: cargo bench --bench simd_bench
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use input_rs::events::{InputEvent, DevIndex};
-use input_rs::processing::mouse::MouseFilter;
-use input_rs::processing::{Filter, FilterChain, FilterKind, FilterResult};
-use smallvec::smallvec;
+use {
+    criterion::{Criterion, black_box, criterion_group, criterion_main},
+    input_rs::{
+        events::{DevIndex, InputEvent},
+        processing::{Filter, FilterChain, FilterKind, FilterResult, mouse::MouseFilter},
+    },
+    smallvec::smallvec,
+};
 
 // ---------------------------------------------------------------------------
 // Baseline: raw 2× f64 multiply (theoretical floor)
@@ -27,15 +30,36 @@ fn raw_2mul(dx: f64, dy: f64, dpi_factor: f64) -> (f64, f64) {
 // ---------------------------------------------------------------------------
 
 fn smallvec_return(dev: DevIndex, time_us: u64, dx: f64, dy: f64) -> FilterResult {
-    smallvec![InputEvent::PointerMotion { device_index: dev, time_us, dx, dy, dx_unaccelerated: dx, dy_unaccelerated: dy }]
+    smallvec![InputEvent::PointerMotion {
+        device_index: dev,
+        time_us,
+        dx,
+        dy,
+        dx_unaccelerated: dx,
+        dy_unaccelerated: dy
+    }]
 }
 
 fn array_return(dev: DevIndex, time_us: u64, dx: f64, dy: f64) -> [InputEvent; 1] {
-    [InputEvent::PointerMotion { device_index: dev, time_us, dx, dy, dx_unaccelerated: dx, dy_unaccelerated: dy }]
+    [InputEvent::PointerMotion {
+        device_index: dev,
+        time_us,
+        dx,
+        dy,
+        dx_unaccelerated: dx,
+        dy_unaccelerated: dy,
+    }]
 }
 
 fn option_return(dev: DevIndex, time_us: u64, dx: f64, dy: f64) -> Option<InputEvent> {
-    Some(InputEvent::PointerMotion { device_index: dev, time_us, dx, dy, dx_unaccelerated: dx, dy_unaccelerated: dy })
+    Some(InputEvent::PointerMotion {
+        device_index: dev,
+        time_us,
+        dx,
+        dy,
+        dx_unaccelerated: dx,
+        dy_unaccelerated: dy,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -63,21 +87,36 @@ fn bench_return_types(c: &mut Criterion) {
 
     group.bench_function("smallvec_1_event", |b| {
         b.iter(|| {
-            let result = smallvec_return(black_box(dev), black_box(1000u64), black_box(5.0f64), black_box(-3.0f64));
+            let result = smallvec_return(
+                black_box(dev),
+                black_box(1000u64),
+                black_box(5.0f64),
+                black_box(-3.0f64),
+            );
             black_box(&result);
         })
     });
 
     group.bench_function("array_1_event", |b| {
         b.iter(|| {
-            let result = array_return(black_box(dev), black_box(1000u64), black_box(5.0f64), black_box(-3.0f64));
+            let result = array_return(
+                black_box(dev),
+                black_box(1000u64),
+                black_box(5.0f64),
+                black_box(-3.0f64),
+            );
             black_box(&result);
         })
     });
 
     group.bench_function("option_1_event", |b| {
         b.iter(|| {
-            let result = option_return(black_box(dev), black_box(1000u64), black_box(5.0f64), black_box(-3.0f64));
+            let result = option_return(
+                black_box(dev),
+                black_box(1000u64),
+                black_box(5.0f64),
+                black_box(-3.0f64),
+            );
             black_box(&result);
         })
     });
@@ -87,7 +126,14 @@ fn bench_return_types(c: &mut Criterion) {
 
 fn bench_filterchain_overhead(c: &mut Criterion) {
     let dev = DevIndex(0);
-    let event = InputEvent::PointerMotion { device_index: dev, time_us: 1000, dx: 5.0, dy: -3.0, dx_unaccelerated: 5.0, dy_unaccelerated: -3.0 };
+    let event = InputEvent::PointerMotion {
+        device_index: dev,
+        time_us: 1000,
+        dx: 5.0,
+        dy: -3.0,
+        dx_unaccelerated: 5.0,
+        dy_unaccelerated: -3.0,
+    };
 
     let mut group = c.benchmark_group("filterchain");
 
@@ -129,7 +175,14 @@ fn bench_mouse_profiles(c: &mut Criterion) {
     let dev = DevIndex(0);
     let mut group = c.benchmark_group("mouse_filter");
 
-    let event = InputEvent::PointerMotion { device_index: dev, time_us: 1000, dx: 5.0, dy: -3.0, dx_unaccelerated: 5.0, dy_unaccelerated: -3.0 };
+    let event = InputEvent::PointerMotion {
+        device_index: dev,
+        time_us: 1000,
+        dx: 5.0,
+        dy: -3.0,
+        dx_unaccelerated: 5.0,
+        dy_unaccelerated: -3.0,
+    };
 
     group.bench_function("flat_1000dpi", |b| {
         let mut mouse = MouseFilter::flat(1000);

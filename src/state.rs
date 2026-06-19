@@ -1,15 +1,20 @@
-use slotmap::{SlotMap, new_key_type};
-use bitvec::prelude::*;
-use std::collections::VecDeque;
-use std::os::unix::io::OwnedFd;
-use crate::backend::{Backend, DeviceInfo, DeviceInfoRef, DeviceCaps};
-use crate::processing::{FilterKind, FilterChain};
-use crate::processing::mouse::{MouseFilter, MouseAccelProfile};
-use crate::processing::debounce::DebounceConfig;
-use crate::processing::touchpad::TouchpadFilter;
-use crate::processing::touchpad_motion::TouchpadMotionFilter;
-use crate::processing::config::TouchpadConfig;
-use crate::events::{InputEvent, DevIndex};
+use {
+    crate::{
+        backend::{Backend, DeviceCaps, DeviceInfo, DeviceInfoRef},
+        events::{DevIndex, InputEvent, TouchEndData},
+        processing::{
+            FilterChain, FilterKind,
+            config::TouchpadConfig,
+            debounce::DebounceConfig,
+            mouse::{MouseAccelProfile, MouseFilter},
+            touchpad::TouchpadFilter,
+            touchpad_motion::TouchpadMotionFilter,
+        },
+    },
+    bitvec::prelude::*,
+    slotmap::{SlotMap, new_key_type},
+    std::{collections::VecDeque, os::unix::io::OwnedFd, time::SystemTime},
+};
 
 new_key_type! {
     pub struct DeviceId;
@@ -26,11 +31,12 @@ pub struct Device {
     /// Compact index used in events for cache efficiency.
     pub index: DevIndex,
     pub buttons_pressed: BitArray<[u64; 12], Lsb0>,
+    pub keys_pressed: BitArray<[u64; 12], Lsb0>,
+    pub touches_active: BitArray<[u64; 1], Lsb0>,
     /// When true, all events from this device are silently dropped.
     /// This implements libinput's "send-events" disabled mode.
     pub disabled: bool,
 }
-
 
 pub struct Seat {
     pub name: String,
@@ -52,14 +58,13 @@ pub struct DeviceGroup {
     pub devices: Vec<DeviceId>,
 }
 
- pub struct DeviceHandle<'a> {
-     _id: DeviceId,
-     _ctx: &'a mut Context,
- }
+pub struct DeviceHandle<'a> {
+    _id: DeviceId,
+    _ctx: &'a mut Context,
+}
 
 impl<'a> DeviceHandle<'a> {
-    pub fn set_natural_scroll(&mut self, _enabled: bool) {
-    }
+    pub fn set_natural_scroll(&mut self, _enabled: bool) {}
 }
 
 impl Context {
@@ -89,13 +94,18 @@ impl Context {
             product_id: dev.info.product_id,
             bus: dev.info.bus,
             capabilities: dev.info.capabilities,
+            supported_switches: &dev.info.supported_switches,
+            switch_states: &dev.info.switch_states,
             seat: &seat.name,
         })
     }
 
     pub fn device(&mut self, id: DeviceId) -> Option<DeviceHandle<'_>> {
         if self.devices.contains_key(id) {
-            Some(DeviceHandle { _id: id, _ctx: self })
+            Some(DeviceHandle {
+                _id: id,
+                _ctx: self,
+            })
         } else {
             None
         }
@@ -107,7 +117,8 @@ impl Context {
 
     /// Look up a DeviceId by its compact DevIndex.
     pub fn device_id_by_index(&self, index: DevIndex) -> Option<DeviceId> {
-        self.devices.iter()
+        self.devices
+            .iter()
             .find(|(_, d)| d.index == index)
             .map(|(id, _)| id)
     }
@@ -116,6 +127,42 @@ impl Context {
     pub fn device_index_by_id(&self, id: DeviceId) -> Option<DevIndex> {
         self.devices.get(id).map(|d| d.index)
     }
+
+    /// Remove a device by compact DevIndex. This is used by higher layers that
+    /// receive monitor-driven removal notifications before the evdev backend
+    /// observes the same fd disappearing.
+    pub fn remove_device_by_index(&mut self, index: DevIndex) -> bool {
+        let Some(id) = self.device_id_by_index(index) else {
+            return false;
+        };
+        self.remove_device(id)
+    }
+
+    /// Remove a device from the input-rs context, release tracked state, reset
+    /// stateful filters, and emit one DeviceRemoved notification.
+    pub fn remove_device(&mut self, id: DeviceId) -> bool {
+        let Some(mut dev) = self.take_device_record(id) else {
+            return false;
+        };
+
+        let _ = self.backend.remove_device(id);
+
+        let device_index = dev.index;
+        let cleanup = release_tracked_device_state(&mut dev, now_us());
+        self.event_queue.extend(cleanup);
+        self.event_queue
+            .push_back(InputEvent::DeviceRemoved { device_index });
+        true
+    }
+
+    fn take_device_record(&mut self, id: DeviceId) -> Option<Device> {
+        let dev = self.devices.remove(id)?;
+        if let Some(seat) = self.seats.get_mut(dev.seat) {
+            seat.devices.retain(|device| *device != id);
+        }
+        Some(dev)
+    }
+
     pub fn create_seat(&mut self, name: &str) -> SeatId {
         self.seats.insert(Seat {
             name: name.to_string(),
@@ -141,81 +188,134 @@ impl Context {
             info: DeviceInfo::default(),
             index: dev_index,
             buttons_pressed: BitArray::ZERO,
+            keys_pressed: BitArray::ZERO,
+            touches_active: BitArray::ZERO,
             disabled: false,
         });
 
         // Now we have the real DeviceId. Pass it along with the FD.
         // The backend opens the device, probes info, and adds to epoll.
-        let info = self.backend.add_device_fd(dev_id, fd, name).unwrap_or_default();
-        self.devices.get_mut(dev_id).unwrap().info = info;
+        let info = self
+            .backend
+            .add_device_fd(dev_id, fd, name)
+            .unwrap_or_default();
+        if let Some(dev) = self.devices.get_mut(dev_id) {
+            if !info.name.is_empty() {
+                dev.name.clone_from(&info.name);
+            }
+            dev.info = info;
+        }
 
         if let Some(seat) = self.seats.get_mut(seat_id) {
             seat.devices.push(dev_id);
         }
 
-        self.event_queue.push_back(InputEvent::DeviceAdded { device_index: dev_index });
+        self.event_queue.push_back(InputEvent::DeviceAdded {
+            device_index: dev_index,
+        });
 
         dev_id
     }
 
     pub fn dispatch(&mut self) -> std::io::Result<()> {
-        let devices = &mut self.devices;
-        let seats = &mut self.seats;
-        let queue = &mut self.event_queue;
+        let mut removed_devices = Vec::new();
 
-        let mut last_id: Option<DeviceId> = None;
-        let mut last_dev_ptr: *mut Device = std::ptr::null_mut();
+        let result = {
+            let devices = &mut self.devices;
+            let seats = &mut self.seats;
+            let queue = &mut self.event_queue;
 
-        self.backend.dispatch(&mut |id, event| {
-            let dev = if Some(id) == last_id {
-                unsafe { &mut *last_dev_ptr }
-            } else {
-                if let Some(d) = devices.get_mut(id) {
+            let mut last_id: Option<DeviceId> = None;
+            let mut last_dev_ptr: *mut Device = std::ptr::null_mut();
+
+            self.backend.dispatch(&mut |id, event| {
+                let backend_device_removed = matches!(event, InputEvent::DeviceRemoved { .. });
+                let dev = if Some(id) == last_id {
+                    unsafe { &mut *last_dev_ptr }
+                } else if let Some(d) = devices.get_mut(id) {
                     last_id = Some(id);
                     last_dev_ptr = d as *mut Device;
                     d
                 } else {
                     return;
+                };
+
+                // If device is disabled, silently drop normal events. Removal
+                // still has to clear the context record.
+                if dev.disabled && !backend_device_removed {
+                    return;
                 }
-            };
 
-            // If device is disabled, silently drop all events
-            if dev.disabled {
-                return;
-            }
+                // Remap device_id in event to our compact index
+                let device_index = dev.index;
 
-            // Remap device_id in event to our compact index
-            let device_index = dev.index;
-
-            if let InputEvent::Key { time_us, pressed: true, .. } = &event {
-                if let Some(seat) = seats.get_mut(dev.seat) {
-                    seat.last_key_time = *time_us;
-                }
-            }
-
-            let seat_ref = seats.get(dev.seat);
-            let info = dev.info.clone();
-
-            // Remap the event's device_id to device_index
-            let remapped = remap_event_device(event, device_index);
-            let filtered_events = dev.filters.process(remapped, seat_ref, Some(info));
-            for filtered in filtered_events {
-                match &filtered {
-                    InputEvent::Key { key, pressed, .. } | InputEvent::PointerButton { button: key, pressed, .. } => {
-                        let k = *key as usize;
-                        if k < 768 {
-                            dev.buttons_pressed.set(k, *pressed);
-                        }
+                if let InputEvent::Key {
+                    time_us,
+                    pressed: true,
+                    ..
+                } = &event
+                {
+                    if let Some(seat) = seats.get_mut(dev.seat) {
+                        seat.last_key_time = *time_us;
                     }
-                    _ => {}
                 }
-                queue.push_back(filtered);
-            }
-        })
+
+                let seat_ref = seats.get(dev.seat);
+                let info = dev.info.clone();
+
+                if backend_device_removed {
+                    let cleanup = release_tracked_device_state(dev, now_us());
+                    queue.extend(cleanup);
+                }
+
+                // Remap the event's device_id to device_index
+                let remapped = remap_event_device(event, device_index);
+                let filtered_events = dev.filters.process(remapped, seat_ref, Some(info));
+                for filtered in filtered_events {
+                    match &filtered {
+                        InputEvent::Key { key, pressed, .. } => {
+                            let k = *key as usize;
+                            if k < 768 {
+                                dev.keys_pressed.set(k, *pressed);
+                            }
+                        }
+                        InputEvent::PointerButton {
+                            button, pressed, ..
+                        } => {
+                            let k = *button as usize;
+                            if k < 768 {
+                                dev.buttons_pressed.set(k, *pressed);
+                            }
+                        }
+                        InputEvent::TouchDown(data) => {
+                            if data.slot >= 0 && data.slot < 64 {
+                                dev.touches_active.set(data.slot as usize, true);
+                            }
+                        }
+                        InputEvent::TouchUp(data) | InputEvent::TouchCancel(data) => {
+                            if data.slot >= 0 && data.slot < 64 {
+                                dev.touches_active.set(data.slot as usize, false);
+                            }
+                        }
+                        _ => {}
+                    }
+                    queue.push_back(filtered);
+                }
+
+                if backend_device_removed {
+                    removed_devices.push(id);
+                }
+            })
+        };
+
+        for id in removed_devices {
+            let _ = self.take_device_record(id);
+        }
+
+        result
     }
 
     pub fn next_event(&mut self) -> Option<InputEvent> {
-
         self.event_queue.pop_front()
     }
 
@@ -245,18 +345,20 @@ impl Context {
             // Plain mouse — flat profile, DPI normalization only
             if let Some(dev) = self.devices.get_mut(id) {
                 let dpi = 1000; // Default; caller can reconfigure
-                dev.filters.add(FilterKind::Mouse(Box::new(MouseFilter::flat(dpi))));
+                dev.filters
+                    .add(FilterKind::Mouse(Box::new(MouseFilter::flat(dpi))));
             }
         }
 
         if caps.contains(DeviceCaps::TOUCHPAD) {
             if let Some(dev) = self.devices.get_mut(id) {
                 dev.filters.add(FilterKind::TouchpadMotion(Box::new(
-                    TouchpadMotionFilter::new(TouchpadConfig::default())
+                    TouchpadMotionFilter::new(TouchpadConfig::default()),
                 )));
-                dev.filters.add(FilterKind::Touchpad(Box::new(
-                    TouchpadFilter::new(130.0, 0.0)
-                )));
+                dev.filters
+                    .add(FilterKind::Touchpad(Box::new(TouchpadFilter::new(
+                        130.0, 0.0,
+                    ))));
             }
         }
 
@@ -269,54 +371,247 @@ impl Context {
 /// Remap the raw DeviceId in an event from the backend to our compact DevIndex.
 fn remap_event_device(event: InputEvent, device_index: DevIndex) -> InputEvent {
     match event {
-            InputEvent::PointerMotion { device_index: _, time_us, dx, dy, dx_unaccelerated, dy_unaccelerated } =>
-            InputEvent::PointerMotion { device_index, time_us, dx, dy, dx_unaccelerated, dy_unaccelerated },
-        InputEvent::PointerButton { device_index: _, time_us, button, pressed } =>
-            InputEvent::PointerButton { device_index, time_us, button, pressed },
-        InputEvent::Key { device_index: _, time_us, key, pressed } =>
-            InputEvent::Key { device_index, time_us, key, pressed },
-        InputEvent::PointerScroll { device_index: _, time_us, dx, dy } =>
-            InputEvent::PointerScroll { device_index, time_us, dx, dy },
-        InputEvent::Frame { device_index: _, time_us } =>
-            InputEvent::Frame { device_index, time_us },
-        InputEvent::DeviceAdded { device_index: _ } =>
-            InputEvent::DeviceAdded { device_index },
-        InputEvent::DeviceRemoved { device_index: _ } =>
-            InputEvent::DeviceRemoved { device_index },
-        InputEvent::TouchDown(mut d) => { d.device_index = device_index; InputEvent::TouchDown(d) }
-        InputEvent::TouchUp(mut d) => { d.device_index = device_index; InputEvent::TouchUp(d) }
-        InputEvent::TouchMotion(mut d) => { d.device_index = device_index; InputEvent::TouchMotion(d) }
-        InputEvent::GestureSwipeBegin(mut d) => { d.device_index = device_index; InputEvent::GestureSwipeBegin(d) }
-        InputEvent::GestureSwipeUpdate(mut d) => { d.device_index = device_index; InputEvent::GestureSwipeUpdate(d) }
-        InputEvent::GestureSwipeEnd(mut d) => { d.device_index = device_index; InputEvent::GestureSwipeEnd(d) }
-        InputEvent::GesturePinchBegin(mut d) => { d.device_index = device_index; InputEvent::GesturePinchBegin(d) }
-        InputEvent::GesturePinchUpdate(mut d) => { d.device_index = device_index; InputEvent::GesturePinchUpdate(d) }
-        InputEvent::GesturePinchEnd(mut d) => { d.device_index = device_index; InputEvent::GesturePinchEnd(d) }
+        InputEvent::PointerMotion {
+            device_index: _,
+            time_us,
+            dx,
+            dy,
+            dx_unaccelerated,
+            dy_unaccelerated,
+        } => InputEvent::PointerMotion {
+            device_index,
+            time_us,
+            dx,
+            dy,
+            dx_unaccelerated,
+            dy_unaccelerated,
+        },
+        InputEvent::PointerButton {
+            device_index: _,
+            time_us,
+            button,
+            pressed,
+        } => InputEvent::PointerButton {
+            device_index,
+            time_us,
+            button,
+            pressed,
+        },
+        InputEvent::Key {
+            device_index: _,
+            time_us,
+            key,
+            pressed,
+        } => InputEvent::Key {
+            device_index,
+            time_us,
+            key,
+            pressed,
+        },
+        InputEvent::PointerScroll {
+            device_index: _,
+            time_us,
+            source,
+            dx,
+            dy,
+        } => InputEvent::PointerScroll {
+            device_index,
+            time_us,
+            source,
+            dx,
+            dy,
+        },
+        InputEvent::SwitchToggle {
+            device_index: _,
+            time_us,
+            switch,
+            enabled,
+        } => InputEvent::SwitchToggle {
+            device_index,
+            time_us,
+            switch,
+            enabled,
+        },
+        InputEvent::Frame {
+            device_index: _,
+            time_us,
+        } => InputEvent::Frame {
+            device_index,
+            time_us,
+        },
+        InputEvent::DeviceAdded { device_index: _ } => InputEvent::DeviceAdded { device_index },
+        InputEvent::DeviceRemoved { device_index: _ } => InputEvent::DeviceRemoved { device_index },
+        InputEvent::TouchDown(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TouchDown(d)
+        }
+        InputEvent::TouchUp(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TouchUp(d)
+        }
+        InputEvent::TouchMotion(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TouchMotion(d)
+        }
+        InputEvent::TouchCancel(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TouchCancel(d)
+        }
+        InputEvent::GestureSwipeBegin(mut d) => {
+            d.device_index = device_index;
+            InputEvent::GestureSwipeBegin(d)
+        }
+        InputEvent::GestureSwipeUpdate(mut d) => {
+            d.device_index = device_index;
+            InputEvent::GestureSwipeUpdate(d)
+        }
+        InputEvent::GestureSwipeEnd(mut d) => {
+            d.device_index = device_index;
+            InputEvent::GestureSwipeEnd(d)
+        }
+        InputEvent::GesturePinchBegin(mut d) => {
+            d.device_index = device_index;
+            InputEvent::GesturePinchBegin(d)
+        }
+        InputEvent::GesturePinchUpdate(mut d) => {
+            d.device_index = device_index;
+            InputEvent::GesturePinchUpdate(d)
+        }
+        InputEvent::GesturePinchEnd(mut d) => {
+            d.device_index = device_index;
+            InputEvent::GesturePinchEnd(d)
+        }
+        InputEvent::GestureHoldBegin(mut d) => {
+            d.device_index = device_index;
+            InputEvent::GestureHoldBegin(d)
+        }
+        InputEvent::GestureHoldEnd(mut d) => {
+            d.device_index = device_index;
+            InputEvent::GestureHoldEnd(d)
+        }
+        InputEvent::TabletToolProximity(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TabletToolProximity(d)
+        }
+        InputEvent::TabletToolAxis(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TabletToolAxis(d)
+        }
+        InputEvent::TabletToolTip(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TabletToolTip(d)
+        }
+        InputEvent::TabletToolButton(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TabletToolButton(d)
+        }
+        InputEvent::TabletPadButton(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TabletPadButton(d)
+        }
+        InputEvent::TabletPadRing(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TabletPadRing(d)
+        }
+        InputEvent::TabletPadStrip(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TabletPadStrip(d)
+        }
+        InputEvent::TabletPadDial(mut d) => {
+            d.device_index = device_index;
+            InputEvent::TabletPadDial(d)
+        }
     }
+}
+
+fn now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+fn release_tracked_device_state(dev: &mut Device, time_us: u64) -> Vec<InputEvent> {
+    let mut cleanup = Vec::new();
+    let device_index = dev.index;
+
+    for key in 0..768 {
+        if dev.keys_pressed[key] {
+            cleanup.push(InputEvent::Key {
+                device_index,
+                time_us,
+                key: key as u32,
+                pressed: false,
+            });
+            dev.keys_pressed.set(key, false);
+        }
+    }
+
+    for button in 0..768 {
+        if dev.buttons_pressed[button] {
+            cleanup.push(InputEvent::PointerButton {
+                device_index,
+                time_us,
+                button: button as u32,
+                pressed: false,
+            });
+            dev.buttons_pressed.set(button, false);
+        }
+    }
+
+    for slot in 0..64 {
+        if dev.touches_active[slot] {
+            cleanup.push(InputEvent::TouchCancel(Box::new(TouchEndData {
+                device_index,
+                time_us,
+                slot: slot as i32,
+            })));
+            dev.touches_active.set(slot, false);
+        }
+    }
+
+    dev.filters.reset_runtime_state();
+    cleanup
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::backend::{Backend, DeviceInfo};
-    use crate::events::InputEvent;
+    use {
+        super::*,
+        crate::{
+            backend::{Backend, DeviceInfo},
+            events::InputEvent,
+        },
+    };
 
     struct MockBackend {
         events: Vec<(DeviceId, InputEvent)>,
     }
 
     impl Backend for MockBackend {
-        fn initialize(&mut self) -> std::io::Result<()> { Ok(()) }
-        fn dispatch(&mut self, callback: &mut dyn FnMut(DeviceId, InputEvent)) -> std::io::Result<()> {
+        fn initialize(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn dispatch(
+            &mut self,
+            callback: &mut dyn FnMut(DeviceId, InputEvent),
+        ) -> std::io::Result<()> {
             for (id, ev) in self.events.drain(..) {
                 callback(id, ev);
             }
             Ok(())
         }
-        fn add_device_fd(&mut self, _id: DeviceId, _fd: std::os::unix::io::OwnedFd, _name: &str) -> std::io::Result<DeviceInfo> {
+        fn add_device_fd(
+            &mut self,
+            _id: DeviceId,
+            _fd: std::os::unix::io::OwnedFd,
+            _name: &str,
+        ) -> std::io::Result<DeviceInfo> {
             Ok(DeviceInfo::default())
         }
-        fn get_fd(&self) -> std::os::unix::io::RawFd { -1 }
+        fn get_fd(&self) -> std::os::unix::io::RawFd {
+            -1
+        }
     }
 
     #[test]
@@ -324,14 +619,29 @@ mod tests {
         let mut ctx = Context::new(Box::new(MockBackend { events: vec![] }));
         let seat_id = ctx.create_seat("seat0");
 
-        let dev_id = ctx.add_device_fd("Mouse0", seat_id, std::fs::File::open("/dev/null").unwrap().into());
-        assert!(matches!(ctx.next_event(), Some(InputEvent::DeviceAdded { .. })));
+        let dev_id = ctx.add_device_fd(
+            "Mouse0",
+            seat_id,
+            std::fs::File::open("/dev/null").unwrap().into(),
+        );
+        assert!(matches!(
+            ctx.next_event(),
+            Some(InputEvent::DeviceAdded { .. })
+        ));
 
         let dev_index = ctx.devices.get(dev_id).unwrap().index;
         let backend = MockBackend {
-            events: vec![
-                (dev_id, InputEvent::PointerMotion { device_index: DevIndex(0), time_us: 100, dx: 10.0, dy: 5.0, dx_unaccelerated: 10.0, dy_unaccelerated: 5.0 })
-            ],
+            events: vec![(
+                dev_id,
+                InputEvent::PointerMotion {
+                    device_index: DevIndex(0),
+                    time_us: 100,
+                    dx: 10.0,
+                    dy: 5.0,
+                    dx_unaccelerated: 10.0,
+                    dy_unaccelerated: 5.0,
+                },
+            )],
         };
 
         ctx.backend = Box::new(backend);
@@ -412,10 +722,77 @@ impl Context {
         }
     }
 
+    /// Enable or disable tap-and-drag for a touchpad device.
+    pub fn set_tap_drag(&mut self, id: DeviceId, enabled: bool) {
+        if let Some(dev) = self.devices.get_mut(id) {
+            dev.filters.set_tap_drag(enabled);
+        }
+    }
+
+    /// Enable or disable tap drag lock for a touchpad device.
+    pub fn set_tap_drag_lock(&mut self, id: DeviceId, enabled: bool) {
+        if let Some(dev) = self.devices.get_mut(id) {
+            dev.filters.set_tap_drag_lock(enabled);
+        }
+    }
+
+    /// Select a touchpad click method.
+    pub fn set_click_method(
+        &mut self,
+        id: DeviceId,
+        method: crate::processing::config::TouchpadClickMethod,
+    ) {
+        if let Some(dev) = self.devices.get_mut(id) {
+            dev.filters.set_click_method(method);
+        }
+    }
+
+    /// Select a touchpad scroll method.
+    pub fn set_scroll_method(
+        &mut self,
+        id: DeviceId,
+        method: crate::processing::config::TouchpadScrollMethod,
+    ) {
+        if let Some(dev) = self.devices.get_mut(id) {
+            dev.filters.set_scroll_method(method);
+        }
+    }
+
+    /// Enable, disable, or replace button scrolling for a pointer device.
+    pub fn set_button_scroll(
+        &mut self,
+        id: DeviceId,
+        enabled: bool,
+        button: u32,
+        lock_enabled: bool,
+    ) {
+        if let Some(dev) = self.devices.get_mut(id) {
+            dev.filters.set_button_scroll(enabled, button, lock_enabled);
+        }
+    }
+
+    /// Set an absolute-device calibration matrix.
+    pub fn set_calibration_matrix(
+        &mut self,
+        id: DeviceId,
+        matrix: crate::processing::absolute_transform::CalibrationMatrix,
+    ) {
+        if let Some(dev) = self.devices.get_mut(id) {
+            dev.filters.set_calibration_matrix(matrix);
+        }
+    }
+
     /// Set left-handed mode for a device.
     pub fn set_left_handed(&mut self, id: DeviceId, enabled: bool) {
         if let Some(dev) = self.devices.get_mut(id) {
             dev.filters.set_left_handed(enabled);
+        }
+    }
+
+    /// Enable or disable middle-button emulation for a pointer device.
+    pub fn set_middle_button_emulation(&mut self, id: DeviceId, enabled: bool) {
+        if let Some(dev) = self.devices.get_mut(id) {
+            dev.filters.set_middle_button_emulation(enabled);
         }
     }
 
@@ -426,16 +803,25 @@ impl Context {
         }
     }
 
-    /// Enable or disable a device. When disabled, all events are silently dropped.
+    /// Enable or disable a device. Disabling first releases tracked keys/buttons
+    /// and cancels tracked touches, then future events are silently dropped.
     /// This implements libinput's "send-events" disabled mode.
     pub fn set_device_enabled(&mut self, id: DeviceId, enabled: bool) {
+        let mut cleanup = Vec::new();
         if let Some(dev) = self.devices.get_mut(id) {
+            if !enabled && !dev.disabled {
+                cleanup = release_tracked_device_state(dev, now_us());
+            }
             dev.disabled = !enabled;
         }
+        self.event_queue.extend(cleanup);
     }
 
     /// Returns whether a device is enabled (not disabled).
     pub fn is_device_enabled(&self, id: DeviceId) -> bool {
-        self.devices.get(id).map(|dev| !dev.disabled).unwrap_or(true)
+        self.devices
+            .get(id)
+            .map(|dev| !dev.disabled)
+            .unwrap_or(true)
     }
 }

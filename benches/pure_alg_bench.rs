@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 #[derive(Clone, Copy)]
 struct DeviceFloatCoords {
@@ -37,14 +37,20 @@ fn trackers_velocity(trackers: &PointerTrackers, time: u64) -> f64 {
         let index = (trackers.cur_tracker + trackers.ntrackers - offset) % trackers.ntrackers;
         let tracker = &trackers.trackers[index];
 
-        if tracker.time > time { break; }
-        if time - tracker.time > MOTION_TIMEOUT { break; }
+        if tracker.time > time {
+            break;
+        }
+        if time - tracker.time > MOTION_TIMEOUT {
+            break;
+        }
 
         let velocity = calculate_trackers_velocity(tracker, time);
 
         dir &= tracker.dir;
         if dir == 0 {
-            if offset == 1 { result = velocity; }
+            if offset == 1 {
+                result = velocity;
+            }
             break;
         }
 
@@ -52,7 +58,9 @@ fn trackers_velocity(trackers: &PointerTrackers, time: u64) -> f64 {
             result = velocity;
             initial_velocity = velocity;
         } else {
-            if (initial_velocity - velocity).abs() > MAX_VELOCITY_DIFF { break; }
+            if (initial_velocity - velocity).abs() > MAX_VELOCITY_DIFF {
+                break;
+            }
             result = velocity;
         }
     }

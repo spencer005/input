@@ -1,9 +1,12 @@
 pub mod evdev;
 
-use std::io;
-use std::os::unix::io::OwnedFd;
-use crate::events::InputEvent;
-use crate::state::DeviceId;
+use {
+    crate::{
+        events::{InputEvent, SwitchKind},
+        state::DeviceId,
+    },
+    std::{io, os::unix::io::OwnedFd},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum BusType {
@@ -27,13 +30,13 @@ pub struct AxisInfo {
 pub struct DeviceCaps(pub u32);
 
 impl DeviceCaps {
-    pub const KEYBOARD:    Self = DeviceCaps(1 << 0);
-    pub const POINTER:     Self = DeviceCaps(1 << 1);
-    pub const TOUCHPAD:    Self = DeviceCaps(1 << 2);
+    pub const KEYBOARD: Self = DeviceCaps(1 << 0);
+    pub const POINTER: Self = DeviceCaps(1 << 1);
+    pub const TOUCHPAD: Self = DeviceCaps(1 << 2);
     pub const TOUCHSCREEN: Self = DeviceCaps(1 << 3);
-    pub const TABLET:      Self = DeviceCaps(1 << 4);
-    pub const TABLET_PAD:  Self = DeviceCaps(1 << 5);
-    pub const SWITCH:      Self = DeviceCaps(1 << 6);
+    pub const TABLET: Self = DeviceCaps(1 << 4);
+    pub const TABLET_PAD: Self = DeviceCaps(1 << 5);
+    pub const SWITCH: Self = DeviceCaps(1 << 6);
 
     pub fn contains(self, other: DeviceCaps) -> bool {
         self.0 & other.0 != 0
@@ -41,6 +44,10 @@ impl DeviceCaps {
 
     pub fn insert(&mut self, other: DeviceCaps) {
         self.0 |= other.0;
+    }
+
+    pub fn remove(&mut self, other: DeviceCaps) {
+        self.0 &= !other.0;
     }
 }
 
@@ -53,6 +60,8 @@ pub struct DeviceInfo {
     pub product_id: u16,
     pub bus: BusType,
     pub capabilities: DeviceCaps,
+    pub supported_switches: Vec<SwitchKind>,
+    pub switch_states: Vec<(SwitchKind, bool)>,
 }
 
 pub struct DeviceInfoRef<'a> {
@@ -61,6 +70,8 @@ pub struct DeviceInfoRef<'a> {
     pub product_id: u16,
     pub bus: BusType,
     pub capabilities: DeviceCaps,
+    pub supported_switches: &'a [SwitchKind],
+    pub switch_states: &'a [(SwitchKind, bool)],
     pub seat: &'a str,
 }
 
@@ -68,5 +79,8 @@ pub trait Backend {
     fn initialize(&mut self) -> io::Result<()>;
     fn dispatch(&mut self, callback: &mut dyn FnMut(DeviceId, InputEvent)) -> io::Result<()>;
     fn add_device_fd(&mut self, id: DeviceId, fd: OwnedFd, name: &str) -> io::Result<DeviceInfo>;
+    fn remove_device(&mut self, _id: DeviceId) -> io::Result<()> {
+        Ok(())
+    }
     fn get_fd(&self) -> std::os::unix::io::RawFd;
 }

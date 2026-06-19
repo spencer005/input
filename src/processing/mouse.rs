@@ -1,8 +1,8 @@
- use crate::events::InputEvent;
-use crate::state::Seat;
-use crate::backend::DeviceInfo;
-use super::{Filter, FilterResult};
-use smallvec::{smallvec, SmallVec};
+use {
+    super::{Filter, FilterResult},
+    crate::{backend::DeviceInfo, events::InputEvent, state::Seat},
+    smallvec::{SmallVec, smallvec},
+};
 
 const MOTION_TIMEOUT: u64 = 1_000_000;
 const MAX_VELOCITY_DIFF: f64 = 0.001; // units/us
@@ -56,7 +56,7 @@ impl MouseConfig {
     /// Create a flat (no-acceleration) config for the given DPI.
     pub fn flat(dpi: i32) -> Self {
         Self {
-            dpi,
+            dpi: normalize_dpi(dpi),
             speed_adjustment: 0.0,
             profile: MouseAccelProfile::Flat,
         }
@@ -73,6 +73,63 @@ impl MouseConfig {
     }
 }
 
+fn normalize_dpi(dpi: i32) -> i32 {
+    if dpi > 0 { dpi } else { 1000 }
+}
+
+pub fn parse_mouse_dpi_property(value: &str) -> Option<i32> {
+    let mut fallback = None;
+    let mut selected = None;
+    let mut saw_token = false;
+
+    for raw in value.split(|c: char| c.is_ascii_whitespace() || c == ',') {
+        if raw.is_empty() {
+            continue;
+        }
+        saw_token = true;
+
+        let (is_selected, token) = match raw.strip_prefix('*') {
+            Some(rest) => (true, rest),
+            None => (false, raw),
+        };
+        if token.is_empty() || token.contains('*') {
+            return None;
+        }
+
+        let dpi_part = match token.split_once('@') {
+            Some((dpi, rate)) => {
+                if parse_positive_i32(rate).is_none() {
+                    return None;
+                }
+                dpi
+            }
+            None => token,
+        };
+
+        let dpi = parse_positive_i32(dpi_part)?;
+        if is_selected && selected.is_none() {
+            selected = Some(dpi);
+        }
+        fallback = Some(dpi);
+    }
+
+    if !saw_token {
+        return None;
+    }
+
+    selected.or(fallback)
+}
+
+fn parse_positive_i32(value: &str) -> Option<i32> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match value.parse::<i32>() {
+        Ok(value) if value > 0 => Some(value),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct Tracker {
     dx: f64,
@@ -83,8 +140,6 @@ struct Tracker {
 pub struct MouseFilter {
     trackers: [Tracker; 16],
     cur_tracker: usize,
-    cumulative_dx: f64,
-    cumulative_dy: f64,
     last_velocity: f64,
     last_accel_factor: f64,
 
@@ -95,6 +150,7 @@ pub struct MouseFilter {
     accel: f64,
     incline_factor: f64,
     // DPI normalization
+    dpi: i32,
     dpi_factor: f64,
 }
 
@@ -114,29 +170,31 @@ impl MouseFilter {
     }
 
     pub fn with_config(config: MouseConfig) -> Self {
-        let dpi_factor = 1000.0 / config.dpi as f64;
+        let dpi = normalize_dpi(config.dpi);
+        let dpi_factor = 1000.0 / dpi as f64;
+        let speed_adjustment = normalize_speed_adjustment(config.speed_adjustment);
 
         let default_threshold = 0.4 / 1000.0;
         let threshold = match &config.profile {
             MouseAccelProfile::Flat | MouseAccelProfile::Custom(_) => 0.0,
-            MouseAccelProfile::Adaptive =>
-            (default_threshold - (0.25 / 1000.0) * config.speed_adjustment).max(0.2 / 1000.0)
+            MouseAccelProfile::Adaptive => {
+                (default_threshold - (0.25 / 1000.0) * speed_adjustment).max(0.2 / 1000.0)
+            }
         };
-        let accel = 2.0 + config.speed_adjustment * 1.5;
-        let incline = 1.1 + config.speed_adjustment * 0.75;
+        let accel = 2.0 + speed_adjustment * 1.5;
+        let incline = 1.1 + speed_adjustment * 0.75;
 
         let mut f = Self {
             trackers: [Tracker::default(); 16],
             cur_tracker: 0,
-            cumulative_dx: 0.0,
-            cumulative_dy: 0.0,
             last_velocity: 0.0,
             last_accel_factor: 1.0,
             profile: config.profile,
-            speed_adjustment: config.speed_adjustment,
+            speed_adjustment,
             threshold,
             accel,
             incline_factor: incline * 1000.0,
+            dpi,
             dpi_factor,
         };
         f.last_accel_factor = f.accel_profile(0.0);
@@ -147,24 +205,37 @@ impl MouseFilter {
         let mut result = 0.0;
         let mut initial_velocity = 0.0;
         let cur = self.cur_tracker;
+        let mut dx = 0.0;
+        let mut dy = 0.0;
 
         for offset in 1..16 {
             let index = (cur + 16 - offset) & 15;
             let tracker = &self.trackers[index];
 
-            if tracker.time == 0 || tracker.time > time { break; }
-            let tdelta = time - tracker.time + 1;
-            if tdelta > MOTION_TIMEOUT { break; }
+            if tracker.time == 0 || tracker.time > time {
+                break;
+            }
+            if offset > 1 {
+                let delta_index = (cur + 16 - offset + 1) & 15;
+                let delta = &self.trackers[delta_index];
+                dx += delta.dx;
+                dy += delta.dy;
+            }
 
-            let dx = self.cumulative_dx - tracker.dx;
-            let dy = self.cumulative_dy - tracker.dy;
+            let tdelta = time.saturating_sub(tracker.time) + 1;
+            if tdelta > MOTION_TIMEOUT {
+                break;
+            }
+
             let velocity = (dx * dx + dy * dy).sqrt() / tdelta as f64;
 
             if initial_velocity == 0.0 || offset <= 2 {
                 result = velocity;
                 initial_velocity = velocity;
             } else {
-                if (initial_velocity - velocity).abs() > MAX_VELOCITY_DIFF { break; }
+                if (initial_velocity - velocity).abs() > MAX_VELOCITY_DIFF {
+                    break;
+                }
                 result = velocity;
             }
         }
@@ -173,6 +244,10 @@ impl MouseFilter {
 
     #[inline(always)]
     fn accel_profile(&self, velocity: f64) -> f64 {
+        if !velocity.is_finite() {
+            return 1.0;
+        }
+
         match &self.profile {
             MouseAccelProfile::Flat => {
                 // Flat profile should be speed-independent (no adaptive accel),
@@ -198,7 +273,13 @@ impl MouseFilter {
                 // Piecewise-linear interpolation over (speed_mm_per_s, factor) points.
                 // Speed values are in mm/s (velocity * 1000 converts from units/us to mm/s).
                 let speed = velocity * 1000.0;
-                if points.is_empty() {
+                if !speed.is_finite() || points.is_empty() {
+                    return 1.0;
+                }
+                if points
+                    .iter()
+                    .any(|(point_speed, factor)| !point_speed.is_finite() || !factor.is_finite())
+                {
                     return 1.0;
                 }
                 // Below first point: use its factor
@@ -224,7 +305,7 @@ impl MouseFilter {
 
     /// Get the current DPI setting.
     pub fn dpi(&self) -> i32 {
-        (1000.0 / self.dpi_factor) as i32
+        self.dpi
     }
 
     /// Get the current speed adjustment.
@@ -236,37 +317,71 @@ impl MouseFilter {
     pub fn profile(&self) -> MouseAccelProfile {
         self.profile.clone()
     }
+
+    pub fn reset_runtime_state(&mut self) {
+        self.trackers = [Tracker::default(); 16];
+        self.cur_tracker = 0;
+        self.last_velocity = 0.0;
+        self.last_accel_factor = self.accel_profile(0.0);
+    }
+}
+
+fn normalize_speed_adjustment(speed: f64) -> f64 {
+    if speed.is_finite() {
+        speed.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 impl Filter for MouseFilter {
-    fn process(&mut self, event: InputEvent, _seat: Option<&Seat>, _info: Option<DeviceInfo>) -> FilterResult {
+    fn process(
+        &mut self,
+        event: InputEvent,
+        _seat: Option<&Seat>,
+        _info: Option<DeviceInfo>,
+    ) -> FilterResult {
         match event {
-            InputEvent::PointerMotion { device_index, time_us, dx, dy, dx_unaccelerated: _, dy_unaccelerated: _ } => {
-            let norm_dx = dx * self.dpi_factor;
-            let norm_dy = dy * self.dpi_factor;
+            InputEvent::PointerMotion {
+                device_index,
+                time_us,
+                dx,
+                dy,
+                dx_unaccelerated: _,
+                dy_unaccelerated: _,
+            } => {
+                let norm_dx = dx * self.dpi_factor;
+                let norm_dy = dy * self.dpi_factor;
+                if !norm_dx.is_finite() || !norm_dy.is_finite() {
+                    self.reset_runtime_state();
+                    return smallvec![];
+                }
 
                 // Flat profile fast path: skip velocity tracking and acceleration.
                 // Only DPI normalization + constant factor needed. No velocity
                 // tracking required for the flat profile since accel is speed-independent.
                 if self.profile == MouseAccelProfile::Flat {
                     let factor = self.accel_profile(0.0);
+                    let out_dx = norm_dx * factor;
+                    let out_dy = norm_dy * factor;
+                    if !out_dx.is_finite() || !out_dy.is_finite() {
+                        self.reset_runtime_state();
+                        return smallvec![];
+                    }
                     return smallvec![InputEvent::PointerMotion {
                         device_index,
                         time_us,
-                        dx: norm_dx * factor,
-                        dy: norm_dy * factor,
+                        dx: out_dx,
+                        dy: out_dy,
                         dx_unaccelerated: norm_dx,
                         dy_unaccelerated: norm_dy,
                     }];
                 }
 
-                self.cumulative_dx += norm_dx;
-                self.cumulative_dy += norm_dy;
-
                 self.cur_tracker = (self.cur_tracker + 1) & 15;
                 self.trackers[self.cur_tracker] = Tracker {
-                    dx: self.cumulative_dx,
-                    dy: self.cumulative_dy,
+                    dx: norm_dx,
+                    dy: norm_dy,
                     time: time_us,
                 };
 
@@ -276,31 +391,91 @@ impl Filter for MouseFilter {
                 let mid_accel_factor = self.accel_profile((self.last_velocity + velocity) * 0.5);
 
                 // Simpson's rule for smooth acceleration transitions
-                let accel_factor = (current_accel_factor + self.last_accel_factor + 4.0 * mid_accel_factor) * (1.0 / 6.0);
+                let accel_factor =
+                    (current_accel_factor + self.last_accel_factor + 4.0 * mid_accel_factor)
+                        * (1.0 / 6.0);
+                if !accel_factor.is_finite() {
+                    self.reset_runtime_state();
+                    return smallvec![];
+                }
 
                 self.last_velocity = velocity;
                 self.last_accel_factor = current_accel_factor;
+                let out_dx = norm_dx * accel_factor;
+                let out_dy = norm_dy * accel_factor;
+                if !out_dx.is_finite() || !out_dy.is_finite() {
+                    self.reset_runtime_state();
+                    return smallvec![];
+                }
 
                 smallvec![InputEvent::PointerMotion {
                     device_index,
                     time_us,
-                    dx: norm_dx * accel_factor,
-                    dy: norm_dy * accel_factor,
+                    dx: out_dx,
+                    dy: out_dy,
                     dx_unaccelerated: norm_dx,
                     dy_unaccelerated: norm_dy,
                 }]
             }
+            InputEvent::DeviceRemoved { .. } => {
+                self.reset_runtime_state();
+                smallvec![event]
+            }
             _ => smallvec![event],
         }
     }
-
-
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_mouse_dpi_property() {
+        let cases = [
+            ("450 *1800 3200", Some(1800)),
+            ("*450 1800 3200", Some(450)),
+            ("450 1800 *3200", Some(3200)),
+            ("450 1800 3200", Some(3200)),
+            ("450 1800 failboat", None),
+            ("450 1800 *failboat", None),
+            ("0 450 1800 *3200", None),
+            ("450@37 1800@12 *3200@6", Some(3200)),
+            ("450@125 *1800@125 3200@125", Some(1800)),
+            ("*this @string fails", None),
+            ("12@34 *45@", None),
+            ("12@a *45@", None),
+            ("12@a *45@25", None),
+            ("                                      * 12, 450, 800", None),
+            (
+                "                                      *12, 450, 800",
+                Some(12),
+            ),
+            ("*12, *450, 800", Some(12)),
+            ("*-23412, 450, 800", None),
+            ("112@125, 450@125, 800@125, 900@-125", None),
+            ("", None),
+            ("   ", None),
+            ("* ", None),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(parse_mouse_dpi_property(value), expected, "value={value:?}");
+        }
+    }
+
+    #[test]
+    fn test_non_positive_dpi_defaults_to_1000() {
+        assert_eq!(MouseFilter::flat(0).dpi(), 1000);
+        assert_eq!(MouseFilter::flat(-400).dpi(), 1000);
+
+        let filter = MouseFilter::with_config(MouseConfig {
+            dpi: 0,
+            speed_adjustment: 0.0,
+            profile: MouseAccelProfile::Adaptive,
+        });
+        assert_eq!(filter.dpi(), 1000);
+    }
 
     #[test]
     fn test_flat_profile_returns_normalized_deltas() {
@@ -309,16 +484,36 @@ mod tests {
 
         // With dpi_factor = 1000/1000 = 1.0, output should equal input
         let result = filter.process(
-            InputEvent::PointerMotion { device_index: dev, time_us: 1000, dx: 5.0, dy: -3.0, dx_unaccelerated: 5.0, dy_unaccelerated: -3.0 },
-            None, None,
+            InputEvent::PointerMotion {
+                device_index: dev,
+                time_us: 1000,
+                dx: 5.0,
+                dy: -3.0,
+                dx_unaccelerated: 5.0,
+                dy_unaccelerated: -3.0,
+            },
+            None,
+            None,
         );
         assert_eq!(result.len(), 1);
         match &result[0] {
-            InputEvent::PointerMotion { dx, dy, dx_unaccelerated, dy_unaccelerated, .. } => {
+            InputEvent::PointerMotion {
+                dx,
+                dy,
+                dx_unaccelerated,
+                dy_unaccelerated,
+                ..
+            } => {
                 assert!((dx - 5.0).abs() < 1e-10, "flat(1000): dx={dx}");
                 assert!((dy - (-3.0)).abs() < 1e-10, "flat(1000): dy={dy}");
-                assert!((dx_unaccelerated - 5.0).abs() < 1e-10, "flat(1000): dx_unaccel={dx_unaccelerated}");
-                assert!((dy_unaccelerated - (-3.0)).abs() < 1e-10, "flat(1000): dy_unaccel={dy_unaccelerated}");
+                assert!(
+                    (dx_unaccelerated - 5.0).abs() < 1e-10,
+                    "flat(1000): dx_unaccel={dx_unaccelerated}"
+                );
+                assert!(
+                    (dy_unaccelerated - (-3.0)).abs() < 1e-10,
+                    "flat(1000): dy_unaccel={dy_unaccelerated}"
+                );
             }
             _ => panic!("expected PointerMotion"),
         }
@@ -326,15 +521,35 @@ mod tests {
         // With dpi_factor = 1000/400 = 2.5, output should be input * 2.5
         let mut filter_400 = MouseFilter::flat(400);
         let result = filter_400.process(
-            InputEvent::PointerMotion { device_index: dev, time_us: 1000, dx: 1.0, dy: 1.0, dx_unaccelerated: 1.0, dy_unaccelerated: 1.0 },
-            None, None,
+            InputEvent::PointerMotion {
+                device_index: dev,
+                time_us: 1000,
+                dx: 1.0,
+                dy: 1.0,
+                dx_unaccelerated: 1.0,
+                dy_unaccelerated: 1.0,
+            },
+            None,
+            None,
         );
         match &result[0] {
-            InputEvent::PointerMotion { dx, dy, dx_unaccelerated, dy_unaccelerated, .. } => {
+            InputEvent::PointerMotion {
+                dx,
+                dy,
+                dx_unaccelerated,
+                dy_unaccelerated,
+                ..
+            } => {
                 assert!((dx - 2.5).abs() < 1e-10, "flat(400): dx={dx}");
                 assert!((dy - 2.5).abs() < 1e-10, "flat(400): dy={dy}");
-                assert!((dx_unaccelerated - 2.5).abs() < 1e-10, "flat(400): dx_unaccel={dx_unaccelerated}");
-                assert!((dy_unaccelerated - 2.5).abs() < 1e-10, "flat(400): dy_unaccel={dy_unaccelerated}");
+                assert!(
+                    (dx_unaccelerated - 2.5).abs() < 1e-10,
+                    "flat(400): dx_unaccel={dx_unaccelerated}"
+                );
+                assert!(
+                    (dy_unaccelerated - 2.5).abs() < 1e-10,
+                    "flat(400): dy_unaccel={dy_unaccelerated}"
+                );
             }
             _ => panic!("expected PointerMotion"),
         }
@@ -346,16 +561,21 @@ mod tests {
         let dev = crate::events::DevIndex(0);
 
         let result = filter.process(
-            InputEvent::Key { device_index: dev, time_us: 1000, key: 0x110, pressed: true },
-            None, None,
+            InputEvent::Key {
+                device_index: dev,
+                time_us: 1000,
+                key: 0x110,
+                pressed: true,
+            },
+            None,
+            None,
         );
         assert_eq!(result.len(), 1);
         match &result[0] {
-            InputEvent::Key { .. } => {},
-        _ => panic!("expected Key event to pass through"),
+            InputEvent::Key { .. } => {}
+            _ => panic!("expected Key event to pass through"),
+        }
     }
-}
-
 
     #[test]
     fn test_flat_profile_with_speed_adjustment() {
@@ -368,15 +588,38 @@ mod tests {
         });
         let dev = crate::events::DevIndex(0);
         let result = filter_slow.process(
-            InputEvent::PointerMotion { device_index: dev, time_us: 1000, dx: 10.0, dy: 10.0, dx_unaccelerated: 10.0, dy_unaccelerated: 10.0 },
-            None, None,
+            InputEvent::PointerMotion {
+                device_index: dev,
+                time_us: 1000,
+                dx: 10.0,
+                dy: 10.0,
+                dx_unaccelerated: 10.0,
+                dy_unaccelerated: 10.0,
+            },
+            None,
+            None,
         );
         match &result[0] {
-            InputEvent::PointerMotion { dx, dy, dx_unaccelerated, dy_unaccelerated, .. } => {
+            InputEvent::PointerMotion {
+                dx,
+                dy,
+                dx_unaccelerated,
+                dy_unaccelerated,
+                ..
+            } => {
                 let expected = 10.0 * 0.04;
-                assert!((dx - expected).abs() < 1e-10, "flat(-0.96): dx={dx}, expected={expected}");
-                assert!((dy - expected).abs() < 1e-10, "flat(-0.96): dy={dy}, expected={expected}");
-                assert!((dx_unaccelerated - 10.0).abs() < 1e-10, "flat(-0.96): unaccel dx={dx_unaccelerated}");
+                assert!(
+                    (dx - expected).abs() < 1e-10,
+                    "flat(-0.96): dx={dx}, expected={expected}"
+                );
+                assert!(
+                    (dy - expected).abs() < 1e-10,
+                    "flat(-0.96): dy={dy}, expected={expected}"
+                );
+                assert!(
+                    (dx_unaccelerated - 10.0).abs() < 1e-10,
+                    "flat(-0.96): unaccel dx={dx_unaccelerated}"
+                );
             }
             _ => panic!("expected PointerMotion"),
         }
@@ -389,14 +632,28 @@ mod tests {
             profile: MouseAccelProfile::Flat,
         });
         let result = filter_fast.process(
-            InputEvent::PointerMotion { device_index: dev, time_us: 2000, dx: 10.0, dy: 10.0, dx_unaccelerated: 10.0, dy_unaccelerated: 10.0 },
-            None, None,
+            InputEvent::PointerMotion {
+                device_index: dev,
+                time_us: 2000,
+                dx: 10.0,
+                dy: 10.0,
+                dx_unaccelerated: 10.0,
+                dy_unaccelerated: 10.0,
+            },
+            None,
+            None,
         );
         match &result[0] {
             InputEvent::PointerMotion { dx, dy, .. } => {
                 let expected = 10.0 * 1.5;
-                assert!((dx - expected).abs() < 1e-10, "flat(+0.5): dx={dx}, expected={expected}");
-                assert!((dy - expected).abs() < 1e-10, "flat(+0.5): dy={dy}, expected={expected}");
+                assert!(
+                    (dx - expected).abs() < 1e-10,
+                    "flat(+0.5): dx={dx}, expected={expected}"
+                );
+                assert!(
+                    (dy - expected).abs() < 1e-10,
+                    "flat(+0.5): dy={dy}, expected={expected}"
+                );
             }
             _ => panic!("expected PointerMotion"),
         }
@@ -421,11 +678,15 @@ mod tests {
         // At very low speed, expect factor close to 0.5 (first point)
         let result = filter.process(
             InputEvent::PointerMotion {
-                device_index: dev, time_us: 1000,
-                dx: 0.1, dy: 0.1,
-                dx_unaccelerated: 0.1, dy_unaccelerated: 0.1,
+                device_index: dev,
+                time_us: 1000,
+                dx: 0.1,
+                dy: 0.1,
+                dx_unaccelerated: 0.1,
+                dy_unaccelerated: 0.1,
             },
-            None, None,
+            None,
+            None,
         );
         assert_eq!(result.len(), 1);
         // The factor should be around 0.5 for very slow motion
@@ -447,15 +708,25 @@ mod tests {
                     dx_unaccelerated: 100.0,
                     dy_unaccelerated: 100.0,
                 },
-                None, None,
+                None,
+                None,
             );
             assert_eq!(result.len(), 1);
             if i > 5 {
                 // Once we're past the threshold, accelerated should exceed unaccelerated
-                if let InputEvent::PointerMotion { dx, dy, dx_unaccelerated, dy_unaccelerated, .. } = &result[0] {
+                if let InputEvent::PointerMotion {
+                    dx,
+                    dy,
+                    dx_unaccelerated,
+                    dy_unaccelerated,
+                    ..
+                } = &result[0]
+                {
                     // At high speed, accel_factor > 1.0, so |dx| > |dx_unaccelerated|
-                    assert!(dx.abs() > dx_unaccelerated.abs() || dx_unaccelerated.abs() < 1e-10,
-                        "accelerated dx={dx} should exceed unaccelerated dx_unaccel={dx_unaccelerated} at high speed");
+                    assert!(
+                        dx.abs() > dx_unaccelerated.abs() || dx_unaccelerated.abs() < 1e-10,
+                        "accelerated dx={dx} should exceed unaccelerated dx_unaccel={dx_unaccelerated} at high speed"
+                    );
                 }
             }
         }
