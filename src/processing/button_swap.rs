@@ -1,7 +1,6 @@
 use {
-    super::{Filter, FilterResult},
+    super::{Filter, Step},
     crate::{backend::DeviceInfo, events::InputEvent, state::Seat},
-    smallvec::smallvec,
 };
 
 /// Swaps BTN_LEFT (0x110) and BTN_RIGHT (0x111) for left-handed mode.
@@ -17,46 +16,17 @@ impl ButtonSwapFilter {
 impl Filter for ButtonSwapFilter {
     fn process(
         &mut self,
-        event: InputEvent,
+        event: &mut InputEvent,
         _seat: Option<&Seat>,
-        _info: Option<DeviceInfo>,
-    ) -> FilterResult {
-        match event {
-            InputEvent::PointerButton {
-                device_index,
-                time_us,
-                button,
-                pressed,
-            } => {
-                let swapped = match button {
-                    0x110 => 0x111, // BTN_LEFT → BTN_RIGHT
-                    0x111 => 0x110, // BTN_RIGHT → BTN_LEFT
-                    other => other,
-                };
-                smallvec![InputEvent::PointerButton {
-                    device_index,
-                    time_us,
-                    button: swapped,
-                    pressed,
-                }]
-            }
-            InputEvent::Key {
-                device_index,
-                time_us,
-                key,
-                pressed,
-            } => {
-                // Some keys like BTN_0/BTN_1 on pointer devices could also
-                // be remapped, but for standard left-handed mode we only
-                // swap the primary buttons.
-                smallvec![InputEvent::Key {
-                    device_index,
-                    time_us,
-                    key,
-                    pressed
-                }]
-            }
-            _ => smallvec![event],
+        _info: Option<&DeviceInfo>,
+    ) -> Step {
+        if let InputEvent::PointerButton { button, .. } = event {
+            *button = match *button {
+                0x110 => 0x111,
+                0x111 => 0x110,
+                other => other,
+            };
         }
+        Step::Keep
     }
 }

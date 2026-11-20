@@ -183,11 +183,12 @@ It does not cover high-level touchpad gestures. Those are tracked in
   touch down and touch motion events when present.
 - [x] Preserve raw single-touch pressure in touch down and touch motion events
   when `ABS_PRESSURE` is present.
-- [ ] Preserve single-touch size/tool metadata where the kernel exposes a
-  reliable non-MT source for that data.
+- [x] Preserve single-touch size metadata from `ABS_TOOL_WIDTH`. Single-touch
+  tool type has no reliable non-MT source yet.
 - [ ] Normalize or document pressure and size units per device, including how
-  callers should interpret devices with missing axis min/max/resolution.
-- [ ] Feed pressure/size metadata into palm/thumb detection policy. Firmware
+  callers should interpret devices with missing axis min/max/resolution. Touch
+  metadata remains raw evdev units; palm/thumb thresholds are documented as raw.
+- [x] Feed pressure/size metadata into palm/thumb detection policy. Firmware
   palm tool classification is handled in `TouchpadMotionFilter`, but pressure
   and size thresholding are tracked in `palm-thumb-and-quirks.md`.
 

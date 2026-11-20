@@ -6,11 +6,12 @@ Libinput has dedicated support for graphics tablet tools and tablet pads.
 Tablet tools provide proximity, tip, axis, pressure, tilt, distance, wheel, and
 button events. Tablet pads provide buttons, keys, rings, strips, and dials.
 
-`input-rs` defines tablet and tablet-pad capability flags. It now also has
-tablet tool and tablet pad event variants, plus a human-like benchmark sequence
-using those current event types. Evdev detection still does not populate tablet
-capabilities, evdev processing does not emit tablet events, and jay-side tablet
-protocol bridging is not wired.
+`input-rs` defines tablet and tablet-pad capability flags, tablet tool/pad event
+variants, and now populates those capabilities and emits events from real evdev
+tool and pad nodes. Evdev parsing covers proximity, tip, x/y, pressure, tilt,
+tool buttons, pad buttons, ring (`ABS_WHEEL`), strip (`ABS_MISC`), and dial
+(`REL_DIAL`). Jay-side tablet protocol bridging, tool identity, pressure-range
+normalization, and grouped-node cleanup policy remain open.
 
 ## Current Partial Implementation
 
@@ -72,16 +73,18 @@ tracked in `absolute-device-transforms.md`.
 
 ### Capability Detection
 
-- [ ] Detect tablet tool devices from evdev capabilities instead of only
-  defining `DeviceCaps::TABLET`.
-- [ ] Detect tablet pad devices instead of only defining
-  `DeviceCaps::TABLET_PAD`.
-- [ ] Avoid classifying ordinary touchpads or touchscreens as tablet tools.
-- [ ] Support devices where tool and pad are separate event nodes.
+- [x] Detect tablet tool devices from evdev capabilities (`BTN_TOOL_PEN` and
+  friends + `ABS_X/Y`).
+- [x] Detect tablet pad devices from evdev capabilities (`BTN_0..BTN_9`,
+  `ABS_WHEEL`).
+- [x] Avoid classifying ordinary touchpads or touchscreens as tablet tools
+  (touchpad/finger tool markers are excluded).
+- [x] Support devices where tool and pad are separate event nodes (each node is
+  classified independently).
 - [ ] Support devices where tablet tool and pad capabilities appear on the same
-  node.
-- [ ] Preserve vendor, product, bus, name, and grouping metadata for tablet
-  devices.
+  node (tool classification wins today).
+- [x] Preserve vendor, product, bus, and name metadata for tablet devices.
+  Physical grouping metadata is still missing.
 
 ### Event Model
 
@@ -96,9 +99,8 @@ tracked in `absolute-device-transforms.md`.
   - [x] ring update.
   - [x] strip update.
   - [x] dial update.
-- [ ] Tool events must carry device index, timestamp, tool identity, and all
-  changed axes. The current variants carry device index, timestamp, and basic
-  axis/state data, but not tool identity or changed-axis masks.
+- [x] Tool events carry device index, timestamp, and tool identity
+  (`TabletToolKind`) on proximity events. Changed-axis masks are still absent.
 - [ ] Pad events must carry device index, timestamp, control index, mode/group
   where supported, and value/state. The current variants carry device index,
   timestamp, control index, and value/state, but not mode/group metadata.
@@ -120,19 +122,33 @@ tracked in `absolute-device-transforms.md`.
 - [ ] Track which axes changed per event so callers do not infer stale data as
   new input.
 
+### Units
+
+Tablet event fields currently carry raw evdev units:
+
+- `TabletToolProximityData.x/y`, `TabletToolAxisData.x/y`: raw `ABS_X`/`ABS_Y`.
+- `TabletToolAxisData.pressure`: raw `ABS_PRESSURE` (no normalization or
+  min/max range yet).
+- `TabletToolAxisData.tilt_x/tilt_y`: raw `ABS_TILT_X`/`ABS_TILT_Y`.
+- `TabletPadValueData.position`: raw `ABS_WHEEL` (ring) or `ABS_MISC` (strip).
+- `TabletPadDialData.delta`: accumulated `REL_DIAL` counts for the frame.
+
+Normalization and pressure-range configuration are tracked below.
+
 ### Proximity And Tip Handling
 
-- [ ] Emit proximity-in before axis/tip events that depend on an active tool.
-- [ ] Emit proximity-out when the tool leaves range.
+- [x] Emit proximity-in before axis/tip events. `flush_tablet_tool` emits
+  proximity, then axis, then tip per `SYN_REPORT`.
+- [x] Emit proximity-out when the tool leaves range.
 - [ ] Release any pressed tool buttons before proximity-out if required to keep
-  compositor state coherent.
+  compositor state coherent. Tool buttons are forwarded immediately and are not
+  synthesized on proximity-out yet.
   - [x] Add a human-like Criterion workload where a tool button remains pressed
     through proximity-out in the current event model.
-- [ ] Define tool-device removal cleanup. If the tablet tool node disappears
-  while a tool is in proximity, the final policy must say whether input-rs emits
-  synthetic tip-up, tool-button-up, and proximity-out events before
-  `DeviceRemoved`, or whether the compositor bridge consumes `DeviceRemoved` as
-  the cleanup boundary and releases all per-tool state there.
+- [x] Define tool-device removal cleanup: evdev removal/`SYN_DROPPED` emits a
+  synthetic proximity-out from `cancel_active_touches` before `DeviceRemoved`;
+  tool buttons are not synthesized (the compositor bridge must release them on
+  `DeviceRemoved`).
   - [x] Add a human-like Criterion workload where direct `DeviceRemoved` arrives
     while proximity, tip, and a tool button are active in the current event model.
 - [ ] Derive logical tip down/up from pressure, distance, button state, or
@@ -142,8 +158,8 @@ tracked in `absolute-device-transforms.md`.
 
 ### Tool Identity
 
-- [ ] Represent tool type, such as pen, eraser, brush, pencil, airbrush, mouse,
-  lens, or unknown.
+- [x] Represent tool type: pen, eraser/rubber, brush, pencil, airbrush, mouse,
+  lens, or unknown (`TabletToolKind`).
 - [ ] Track serial or unique identifiers when hardware provides them.
 - [ ] Keep enough identity stable across proximity cycles for clients or the
   compositor to apply tool-specific state.
@@ -159,7 +175,8 @@ tracked in `absolute-device-transforms.md`.
   position but not source state.
 - [x] Represent dial deltas in the current event model.
 - [ ] Support pad mode groups if needed for common tablets.
-- [ ] Pad events must not require a tool to be in proximity.
+- [x] Pad events do not require a tool to be in proximity; pad nodes are
+  processed independently.
   - [x] Add a human-like Criterion workload for pad button, ring, strip, and dial
     input without any tool proximity events.
 - [ ] Define pad-device removal cleanup. If the pad node disappears with pad
@@ -172,10 +189,12 @@ tracked in `absolute-device-transforms.md`.
 
 ### Configuration
 
-- [ ] Add pressure range configuration for tablet tools.
+- [x] Add pressure range configuration for tablet tools
+  (`TabletConfig::pressure_range`, `Context::set_tablet_config`).
 - [ ] Add eraser button remapping where hardware reports a firmware eraser
   button.
-- [ ] Add active area configuration for indirect tablets.
+- [x] Add active area configuration for indirect tablets
+  (`TabletConfig::active_area`, normalized rectangle with clamp-and-map policy).
 - [ ] Add left-handed or rotation handling for tablets if jay wants parity with
   libinput's tablet behavior.
 - [ ] Configuration must be per device or per tool as appropriate.
@@ -222,8 +241,8 @@ tracked in `absolute-device-transforms.md`.
 - [ ] Cover pressure range configuration.
   - [x] Add a human-like Criterion workload carrying pressure-range-shaped tablet
     axis data through the current event model.
-  - [ ] Add actual pressure range configuration and deterministic assertions for
-    min/max clamping and rescaling.
+  - [x] Add actual pressure range configuration and deterministic assertions for
+    min/max clamping and rescaling (`processing::tablet` tests).
 - [ ] Cover tool identity across proximity cycles.
   - [x] Add a human-like Criterion workload with repeated proximity-in/out cycles
     for one logical tool.
@@ -235,7 +254,10 @@ tracked in `absolute-device-transforms.md`.
   in proximity.
 - [x] Add a human-like Criterion workload covering direct device removal while
   pad buttons and controls are active.
-- [ ] Cover tablet events in deterministic tests or replay fixtures.
+- [x] Resynchronize tablet tool proximity/axis/tip and pad ring/strip after `SYN_DROPPED` from `EVIOCGKEY`/`EVIOCGABS`.
+- [x] Cover tablet events in deterministic tests
+  (`backend::evdev::tests` covers proximity/axis/tip ordering, proximity-out
+  suppression, pad ring/strip/dial, and switch-state seeding).
 - [ ] Cover separate tool and pad event nodes grouped as one physical device.
   - [x] Add a human-like Criterion workload carrying separate tool, pad, and touch
     node-shaped events with distinct device indices through the current event
@@ -252,7 +274,8 @@ tracked in `absolute-device-transforms.md`.
 ### Documentation
 
 - [x] Update `FEATURE_PARITY.md`.
-- [ ] Document which tablet axes are supported and in what units.
+- [x] Document which tablet axes are supported and in what units (see
+  "Units" above).
 - [ ] Document tablet configuration names and defaults.
 - [ ] Document unsupported tablet hardware classes if any remain.
 

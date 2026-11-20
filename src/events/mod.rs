@@ -2,7 +2,7 @@ use std::fmt;
 
 /// Compact device index used in events for cache efficiency.
 /// Maps to full DeviceId via Context lookup when needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct DevIndex(pub u32);
 
 impl fmt::Display for DevIndex {
@@ -240,6 +240,35 @@ pub struct TabletToolProximityData {
     pub x: f64,
     pub y: f64,
     pub in_range: bool,
+    pub tool: Option<TabletToolKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TabletToolKind {
+    Pen,
+    Rubber,
+    Brush,
+    Pencil,
+    Airbrush,
+    Mouse,
+    Lens,
+    Unknown(u32),
+}
+
+impl TabletToolKind {
+    pub fn from_linux_code(code: u32) -> Option<Self> {
+        Some(match code {
+            0x140 => Self::Pen,
+            0x141 => Self::Rubber,
+            0x142 => Self::Brush,
+            0x143 => Self::Pencil,
+            0x144 => Self::Airbrush,
+            0x146 => Self::Mouse,
+            0x147 => Self::Lens,
+            0x148..=0x14a | 0x14d..=0x14f => return None,
+            other => Self::Unknown(other),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

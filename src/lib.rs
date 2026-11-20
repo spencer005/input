@@ -2,13 +2,26 @@ pub mod backend;
 pub mod events;
 pub mod policy;
 pub mod processing;
+pub mod profile;
 pub mod state;
 
 pub use {
     backend::evdev::EvdevBackend,
-    events::{DevIndex, ScrollSource, SwitchKind, TouchData, TouchEndData, TouchToolType},
-    processing::{debounce::DebounceConfig, mouse::MouseAccelProfile},
-    state::{Context, DeviceId, GroupId, SeatId},
+    events::{
+        DevIndex, ScrollSource, SwitchKind, TabletToolKind, TouchData, TouchEndData, TouchToolType,
+    },
+    processing::{
+        DeviceConfigSnapshot,
+        button_map::ButtonMap,
+        config::{ClickfingerButtonMap, TapButtonMap, TouchpadClickMethod, TouchpadScrollMethod},
+        debounce::DebounceConfig,
+        mouse::{MouseAccelProfile, MouseConfigError},
+        rotation::{RelativeRotationFilter, RotationError},
+        scroll_scale::ScrollScaleFilter,
+        tablet::{ActiveArea, TabletConfig, TabletTransformFilter},
+    },
+    profile::{DeviceProfile, ProfileMatch, match_profile},
+    state::{Context, DeviceId, DisableReason, GroupId, SeatId, SwitchPolicy},
 };
 
 #[cfg(test)]

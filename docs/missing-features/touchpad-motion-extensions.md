@@ -64,9 +64,14 @@ This document does not cover:
 
 ### Ownership And Configuration
 
-- [ ] Decide which extensions are supported and which are explicitly not planned.
-  Unsupported extensions must be marked as not planned in `FEATURE_PARITY.md`
-  with a reason.
+- [x] Decide which extensions are supported and which are explicitly not planned.
+  Decision for this pass: all four touchpad motion extensions
+  (pressure-dependent motion, edge-motion continuation, active rectangle, and
+  180-degree touchpad coordinate rotation) are **not planned**. They are
+  synaptics-era extensions rather than libinput parity. Relative-device rotation
+  is implemented separately in `absolute-device-transforms.md`; generic
+  left-handed mouse/clickpad policy is implemented in the tap/click path.
+  `FEATURE_PARITY.md` records the decision.
 - [ ] Every supported extension must have input-rs-owned configuration. jay may
   store and forward config, but input-rs must own the behavior.
 - [ ] Every supported extension must have per-device configuration and a defined

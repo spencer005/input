@@ -108,19 +108,23 @@ It does not cover clickpad button areas themselves. Those are tracked in
   and frame processing.
 - [x] Do not require pressure or size axes for ordinary touchpads to keep
   working.
-- [ ] Normalize pressure and size values against device axis ranges, or
-  explicitly document that all policy thresholds are raw device units.
+- [x] Normalize pressure and size values against device axis ranges, or
+  explicitly document that all policy thresholds are raw device units. Current
+  `palm_pressure_threshold`, `palm_size_threshold`, and
+  `thumb_pressure_threshold` are documented as raw evdev units.
 
 ### Palm Detection
 
-- [ ] Keep edge-zone palm detection but make its geometry explicit and
-  configurable per device or profile.
-- [ ] Add pressure-based palm detection for devices with pressure data.
-- [ ] Add size-based palm detection for devices with touch-major data.
+- [x] Keep edge-zone palm detection but make its geometry explicit and
+  configurable per device or profile (`palm_edge_ratio`, profiles).
+- [x] Add pressure-based palm detection for devices with pressure data.
+- [x] Add size-based palm detection for devices with touch-major data.
 - [x] Honor firmware palm/tool classification when provided on `TouchDown` as
   `TouchToolType::Palm` and `palm_detection` is enabled.
-- [ ] Handle firmware palm/tool classification that arrives after touch down,
-  including deterministic rules for whether an active finger can become a palm.
+- [x] Handle firmware palm/tool classification that arrives after touch down.
+  A late `Palm` on `TouchMotion` latches the palm, decrements the tap finger
+  count, drops pending motion, and cancels the gesture when no finger remains.
+  Palms are never reclassified back to fingers during the same contact.
 - [ ] A touch classified as palm must not emit pointer motion, scroll, tap,
   click, or unintended gesture events.
   - [x] The current filter suppresses pointer motion, scroll, tap, and click
@@ -140,8 +144,8 @@ It does not cover clickpad button areas themselves. Those are tracked in
 
 ### Thumb Detection
 
-- [ ] Detect likely thumbs based on pressure, size, touch position, speed, or
-  relative position to active fingers.
+- [x] Detect likely thumbs based on pressure and touch position relative to
+  active fingers (size/speed heuristics remain future work).
 - [x] Thumb detection must be able to ignore a resting thumb during pointer
   motion by another finger.
 - [ ] Thumb detection must not break intentional clickpad bottom-area clicks.
@@ -160,59 +164,59 @@ It does not cover clickpad button areas themselves. Those are tracked in
 
 ### DWT And DWTP
 
-- [ ] Keep disable-while-typing but make its timeout configurable or documented
-  as an intentional fixed policy.
-- [ ] DWT must distinguish internal keyboard activity from unrelated external
-  keyboards if device grouping metadata is available.
+- [x] Keep disable-while-typing and make its timeout configurable
+  (`dwt_timeout_us`, `Context::set_touchpad_dwt_timeout`).
+- [x] DWT distinguishes internal keyboard activity from external keyboards when
+  bus-derived internal classification is available (default
+  `Context::dwt_internal_only = true`).
 - [ ] DWT must not suppress touchpads for modifier-only or compositor-generated
   events unless that is deliberate.
-- [ ] Implement disable-while-trackpointing for devices grouped with a
-  trackpoint.
-- [ ] DWTP must suppress touchpad motion while the trackpoint is active and
-  restore touchpad input after a timeout.
+- [x] Implement disable-while-trackpointing using `POINTING_STICK` capability
+  (sysfs grouping remains future work).
+- [x] DWTP suppresses touchpad motion while the trackpoint is active and restores
+  after `dwtp_timeout_us` (`test_dwtp_suppresses_touchpad_while_trackpoint_active`).
 - [ ] DWT and DWTP must not suppress physical buttons that are required for a
-  grouped trackpoint, such as top buttons on some Lenovo clickpads.
+  grouped trackpoint, such as top buttons on some Lenovo clickpads. Current
+  suppression applies to pointer motion/taps, not physical button passthrough;
+  top-button clickpad capability is detected but has no policy yet.
 
 ### Stylus And Tablet Arbitration
 
-- [ ] For devices that have touch and stylus components, suppress accidental
-  touch input while a stylus is in proximity where appropriate.
-- [ ] Stylus arbitration must depend on device grouping, not only global seat
-  state.
-- [ ] Touch input must resume when stylus proximity ends.
+- [x] For devices that have touch and stylus components, suppress accidental
+  touch input while a stylus is in proximity (`stylus_arbitration`).
+- [ ] Stylus arbitration depends on seat-level `stylus_in_proximity`; per-group
+  stylus/touch relationships remain future work.
+- [x] Touch input resumes when stylus proximity ends
+  (`test_stylus_proximity_suppresses_touchpad`).
 
 ### Device Overrides And Metadata
 
-- [ ] Add an explicit device-profile or override representation for
+- [x] Add an explicit device-profile or override representation for
   model-specific thresholds, broken axes, device classes, button areas, and
   grouping hints.
   - [x] Add a human-like Criterion workload carrying device-profile-shaped
-    metadata through the current standalone policy model. This only exercises the
-    metadata fields that exist today: bus, vendor id, product id, and internal
-    classification.
-  - [ ] Define the actual profile schema. Completion requires named fields for
-    palm edge geometry, thumb edge geometry, pressure thresholds, size
-    thresholds, DWT timeout, DWTP timeout, clickpad button areas, button maps,
-    device class overrides, grouping hints, and broken/ignored axes.
-- [ ] Match automatic overrides using stable metadata such as
-  bus/vendor/product/name and any required sysfs attributes, or require users to
-  select a profile explicitly when automatic matching would be ambiguous.
-  - [ ] Include enough match keys to distinguish devices that share
-    bus/vendor/product but differ by name, physical path, sysfs attributes,
-    capabilities, or firmware-reported axis ranges.
-  - [ ] Define conflict behavior when more than one profile matches: explicit
-    user selection must win, exact metadata matches must beat broad defaults,
-    and ambiguous automatic matches must either be rejected with diagnostics or
-    resolved by a documented priority order.
-- [ ] Overrides must be data-driven enough that adding a device profile does
-  not require changing core state machine code.
-- [ ] Override values must be visible in debug logs or diagnostics so device
-  behavior can be explained.
-- [ ] A missing or malformed override must fall back to safe defaults.
-  - [ ] Safe fallback must mean the device still works as a normal input device:
+    metadata through the standalone policy model.
+  - [x] Define the actual profile schema (`profile::DeviceProfile`,
+    `TouchpadProfile`, `PointerProfile`, `BrokenAxes`): palm/thumb geometry,
+    pressure/size thresholds, DWT/DWTP timeouts, clickpad button geometry/maps,
+    tap timing, pointer DPI/speed/rotation, device-class/internal override, and
+    broken-axis declarations.
+- [x] Match automatic overrides using stable metadata such as
+  bus/vendor/product/name, or require users to explicitly select a profile.
+  - [x] Match keys distinguish bus, vendor, product, and exact name.
+    Physical-path/sysfs/capability/firmware-range keys remain future work.
+  - [x] Conflict behavior: explicit selection by name wins; more match keys beat
+    fewer; equally specific matches are rejected as ambiguous with a
+    `tracing::warn` diagnostic and safe defaults.
+- [x] Overrides are data-driven and do not require changing core state-machine
+  code to add a device profile.
+- [x] Override application is visible through `Context::device_profile_name()`
+  and ambiguity/invalid-config warnings.
+- [x] A missing or malformed override falls back to safe defaults (no profile
+  match, sanitized touchpad config, device still works).
+  - [x] Safe fallback means the device still works as a normal input device:
     no panic, no hidden hard-coded model behavior, no disabled device unless an
-    explicit policy says so, and a diagnostic that explains why the override was
-    ignored.
+    explicit policy says so, and a diagnostic for rejected/ambiguous profiles.
 
 ### Device Grouping
 
@@ -231,13 +235,15 @@ It does not cover clickpad button areas themselves. Those are tracked in
     through the event model.
   - [x] Add a human-like Criterion workload for a high-pressure contact shaped
     like a palm candidate but without a firmware palm tool flag.
-  - [ ] Add actual pressure threshold policy and deterministic assertions.
+  - [x] Add pressure threshold policy and deterministic assertions
+    (`test_pressure_and_size_palm_thresholds`).
 - [ ] Cover size-based palm rejection.
   - [x] Add a human-like Criterion workload that carries touch-major/minor
     metadata through the event model.
   - [x] Add a human-like Criterion workload for a large touch-major/minor contact
     shaped like a palm candidate but without a firmware palm tool flag.
-  - [ ] Add actual size threshold policy and deterministic assertions.
+  - [x] Add size threshold policy and deterministic assertions
+    (`test_pressure_and_size_palm_thresholds`).
 - [ ] Cover firmware palm/tool classification.
   - [x] Add a human-like Criterion workload with a palm-classified contact
     carrying pressure, size, tool type, and tracking id.
@@ -248,8 +254,9 @@ It does not cover clickpad button areas themselves. Those are tracked in
     with `palm_detection` disabled.
   - [x] Add a human-like Criterion workload where a firmware-palm-shaped contact
     appears while a three-finger swipe stream is active.
-  - [ ] Add deterministic assertions for firmware-palm suppression, ordinary
-    finger preservation, and runtime `palm_detection = false` behavior.
+  - [x] Add deterministic assertions for firmware-palm suppression and late
+    reclassification (`test_late_firmware_palm_reclassification_suppresses_motion`).
+    Runtime `palm_detection = false` remains covered by benchmark-shaped input.
 - [x] Add a human-like Criterion workload for thumb resting during pointer
   motion.
 - [x] Add human-like Criterion workloads for a lower-zone single contact and an
@@ -258,27 +265,30 @@ It does not cover clickpad button areas themselves. Those are tracked in
 - [x] Add human-like Criterion workloads for current DWT suppression after an
   internal-keyboard-shaped timestamp and non-suppression for an
   external-keyboard-shaped case that does not update the touchpad seat timestamp.
-- [ ] Add deterministic assertions once internal/external keyboard grouping is
-  represented in the production DWT path.
+- [x] Add deterministic assertions for the production DWT path
+  (`test_dwt` covers timeout; `Context::dwt_internal_only` gates external
+  keyboards). Sysfs grouping remains future work.
 - [ ] Cover DWTP with a grouped trackpoint.
   - [x] Add a human-like Criterion workload carrying grouped
     keyboard/touchpad/trackpoint-shaped metadata through the current standalone
     policy model.
-  - [ ] Implement actual DWTP suppression/restoration behavior and deterministic
-    assertions for grouped trackpoint activity.
+  - [x] Implement DWTP suppression/restoration and deterministic assertions
+    (`test_dwtp_suppresses_touchpad_while_trackpoint_active`). Capability-based,
+    not sysfs-group-based yet.
 - [ ] Cover stylus proximity suppressing touch.
   - [x] Add a human-like Criterion workload carrying stylus proximity/tip/axis
     events interleaved with a touch contact through the current event model.
-  - [ ] Implement actual stylus-touch arbitration and deterministic assertions
-    for suppression while stylus is in proximity and restoration after proximity
-    ends.
+  - [x] Implement stylus-touch arbitration and deterministic assertions for
+    suppression and restoration
+    (`test_stylus_proximity_suppresses_touchpad`).
 - [ ] Cover device-profile/override matching and fallback behavior.
   - [x] Add a human-like Criterion workload carrying known internal touchpad,
     internal PS/2, and unknown internal fallback metadata through the current
     standalone policy model.
-  - [ ] Add actual profile matching, conflict handling, malformed-profile
-    fallback, user-selected profile override, and deterministic coverage for
-    every supported match key.
+  - [x] Add profile matching, conflict handling, fallback, explicit selection,
+    and deterministic coverage for bus/vendor/product/name specificity
+    (`profile::tests`, `device_profile_applies_defaults_on_add`,
+    `explicit_profile_selection_ignores_match_keys`).
 
 ### Documentation
 

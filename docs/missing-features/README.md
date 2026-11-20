@@ -170,6 +170,45 @@ implementation benchmark.
 When a missing feature is implemented, update its benchmark group so it measures
 the real backend, event model, filter, or policy path.
 
+## Deterministic Coverage Added
+
+`input-rs` now has deterministic unit tests for several previously
+benchmark-only behaviors:
+
+- tap button maps, clickfinger maps, tap finger-count limits, configurable tap
+  timeout/movement thresholds;
+- drag lock hold/unlock/timeout and drag-lock timeout dispatch without input;
+- clickpad detection gating, configurable button areas, left-handed touchpad
+  policy, physical button swapping, and clickfinger mapping;
+- pressure/size palm thresholds and late firmware palm reclassification;
+- DWT/DWTP expiration and stylus-proximity suppression;
+- middle-button chord synthesis and timer-deadline flush;
+- relative rotation (identity/90/180/arbitrary/scroll/invalid) and calibration
+  identity/inversion/rotation/clamping/rejection;
+- tablet tool proximity/axis/tip ordering, proximity-out suppression, pad
+  ring/strip/dial events, and switch-state seeding;
+- switch-driven tablet-mode disable/restore, initial state, removal-source
+  cleanup, user-disable composition, and external-mouse policy;
+- device-profile matching, specificity, ambiguity, explicit selection, and
+  overrides;
+- debounce per-code isolation, deadline-driven releases/represses, held-code
+  seeding, and flush traversal;
+- timeout-generated events traversing the remaining filter chain and canonical
+  setter ordering;
+- held-button remapping on left-handed changes, middle-emulation flush/disengage,
+  and button-scroll disengage;
+- custom acceleration validation, physical mm/s curve units, newest-sample
+  velocity inclusion, and time-windowed velocity tracking;
+- transactional device add, high-resolution scroll representation selection,
+  and `SYN_DROPPED` key/button plus tablet/pad absolute resynchronization;
+- explicit per-axis scroll scaling/inversion, arbitrary pointer-button
+  remapping, and effective-configuration snapshots;
+- tablet tool identity, pressure-range normalization, and active-area mapping.
+
+These are unit-level tests; they do not replace the Criterion workloads, but
+they now provide the deterministic assertions the completion rule requires for
+the covered paths.
+
 ## Current Local References
 
 The current implementation is centered around these files:

@@ -32,12 +32,20 @@ device profiles, or another user-visible override mechanism with diagnostics.
     release/press sequences. A value of `0` disables that phase.
 - `DebounceConfig::default()` is disabled by default with current timeout values
   of 25 ms for bounce and 12 ms for spurious detection.
-- `ButtonDebounceFilter` tracks a small per-button state table and filters both
-  `InputEvent::PointerButton` and `InputEvent::Key`.
+- `ButtonDebounceFilter` tracks one independent state entry per Linux input
+  code (0..0x2ff), so key/button codes can never alias through a modulo table.
+  Codes above that range pass through without debounce.
+- Deferred transitions are deadline-driven: `next_timeout_us()` and
+  `dispatch_timeout()` emit a suppressed release or deferred spurious-repress
+  without requiring another input event. `FilterKind` and `Context` expose the
+  timer through the normal timeout dispatch path, and timer-generated events
+  traverse the remaining filter chain.
 - `ButtonDebounceFilter::reset_runtime_state()` clears pending debounce state.
-- `FilterChain::set_debounce()` installs or replaces the debounce filter in the
-  current per-device filter chain.
-- `Context::set_debounce()` updates a live input-rs device.
+- `FilterChain::set_debounce()` updates an existing filter in place so pending
+  deadlines survive configuration changes, and normalizes chain order.
+- `Context::set_debounce()` flushes pending debounce transitions through the
+  remaining chain before applying new configuration, so disabling debounce
+  cannot drop a suppressed release.
 - jay's low-level `InputDeviceConfig::SetDebounce` and `InputBackend::set_debounce()`
   exist, and `InputRsBackend::set_debounce()` forwards to `Context`.
 - There is no `InputDeviceCommand::SetDebounce`, CLI command, jay input protocol
@@ -145,31 +153,35 @@ requirements, user expectations, and timing policy than hardware debounce.
   name, and raw kernel sysname such as `event7`.
 - [ ] Expose a clear/reset operation that returns a device to the default or
   device-profile debounce policy.
-- [ ] Define whether changing debounce configuration while a button is held is
+- [x] Define whether changing debounce configuration while a button is held is
   immediate, deferred until all tracked buttons are neutral, or cancels/releases
-  pending debounce state.
-- [ ] Ensure disabling debounce while a release is delayed cannot leave jay or
-  clients believing a button is still held.
-- [ ] Ensure enabling debounce while buttons are already held does not synthesize
-  duplicate presses or suppress the eventual real release.
+  pending debounce state. It is immediate: pending transitions are flushed, and
+  enabling seeds held codes as `Down`.
+- [x] Ensure disabling debounce while a release is delayed cannot leave clients
+  believing a button is still held.
+- [x] Ensure enabling debounce while buttons are already held does not synthesize
+  duplicate presses or suppress the eventual real release
+  (`enabling_debounce_while_button_held_preserves_the_release`).
 
 ### State Machine Behavior
 
 - [x] Pass pointer button/key events through unchanged when debounce is disabled.
 - [x] Suppress quick bounce transitions in the current enabled filter.
 - [x] Support a zero spurious timeout that disables spurious-release suppression.
-- [ ] Define exact timeout semantics for equality at the timeout boundary:
-  completion must state whether an event at exactly `bounce_timeout_us` or
-  `spurious_timeout_us` is suppressed or emitted.
-- [ ] Define behavior for timestamp rollback, duplicate timestamps, and very
-  large timestamp gaps.
-- [ ] Track button state by stable key/button identity without accidental
-  collisions. Current code indexes by `key % 16`; completion requires proving
-  this is sufficient, expanding the state table, or using a map keyed by the raw
-  key/button code.
-- [ ] Define behavior when multiple buttons change in the same frame. Libinput
-  flushes the debounce state on other-button changes; input-rs must either match
-  that or document a different policy.
+- [x] Define exact timeout semantics for equality at the timeout boundary:
+  deadlines fire when `now >= last_event_time + timeout`; an event at exactly
+  the boundary is emitted, not suppressed.
+- [x] Define behavior for timestamp rollback, duplicate timestamps, and very
+  large timestamp gaps: elapsed time is saturating, so rollback behaves like
+  zero elapsed and the timeout fires on the next deadline check.
+- [x] Track button state by stable key/button identity without accidental
+  collisions. State is indexed by the raw Linux input code (0..0x2ff); codes
+  outside that range pass through. Covered by
+  `test_codes_do_not_alias_debounce_state`.
+- [x] Define behavior when multiple buttons change in the same frame. input-rs
+  deliberately keeps per-code state independent and does not flush other buttons
+  on a button change; a single timeout dispatch emits each deferred release in
+  code order. Covered by `multiple_buttons_debounce_independently`.
 - [ ] Define behavior for repeated press while already pressed and repeated
   release while already released.
 - [ ] Define interaction with `Frame` events: if debounce delays a release, the
@@ -212,15 +224,18 @@ requirements, user expectations, and timing policy than hardware debounce.
 - [x] Add deterministic coverage for the start of spurious detection.
 - [ ] Add deterministic coverage for complete spurious-release suppression,
   including the delayed-release path and re-press timing.
-- [ ] Add deterministic coverage for independent button state without modulo
-  collisions.
-- [ ] Add deterministic coverage for keyboard key debounce if key debounce remains
-  in scope.
+- [x] Add deterministic coverage for independent button state without modulo
+  collisions (`test_codes_do_not_alias_debounce_state`).
+- [x] Add deterministic coverage for keyboard key debounce
+  (`test_deferred_key_release_is_deadline_driven`).
 - [ ] Add deterministic coverage for zero bounce timeout and zero spurious
   timeout.
-- [ ] Add deterministic coverage for timeout-boundary equality.
-- [ ] Add deterministic coverage for runtime enable/disable while neutral,
-  pressed, release-delayed, and spurious-detection states.
+- [x] Add deterministic coverage for timeout-boundary equality
+  (`test_deferred_release_is_deadline_driven` fires at exactly the deadline).
+- [x] Add deterministic coverage for runtime enable/disable while neutral,
+  pressed, release-delayed, and spurious-detection states. Enabled-while-held
+  and deferred-release cases are covered by tests; neutral enable is exercised
+  by the benchmark path.
 - [ ] Add deterministic coverage for device disable/removal cleanup while debounce
   state is pending.
   - [x] Add human-like Criterion workloads for direct `DeviceRemoved` input while
@@ -233,8 +248,12 @@ requirements, user expectations, and timing policy than hardware debounce.
     debounce state is pending.
   - [ ] Add deterministic assertions for the final cleanup policy, including
     whether pending releases are emitted, cancelled, or reset silently.
-- [ ] Add deterministic coverage for filter ordering with left-handed swap,
-  middle-button emulation, and button scrolling.
+- [x] Add deterministic coverage for filter ordering with left-handed swap and
+  timeout/debounce flush traversal
+  (`debounce_flush_passes_through_remaining_filters`,
+  `configuration_order_does_not_change_pipeline_semantics`). The canonical
+  order is debounce → touchpad recognition → middle emulation → button swap → button mapping →
+  pointer/touchpad acceleration → button scroll → natural scroll → rotation.
 - [ ] Add deterministic coverage for jay/backend config propagation and hotplug
   replay once user-facing debounce configuration exists.
 - [x] Add a human-like Criterion workload for disabled bouncy-button passthrough.

@@ -1,7 +1,6 @@
 use {
-    super::{Filter, FilterResult},
+    super::{Filter, Step},
     crate::{backend::DeviceInfo, events::InputEvent, state::Seat},
-    smallvec::smallvec,
 };
 
 const TP_MAGIC_SLOWDOWN: f64 = 0.2968;
@@ -137,103 +136,75 @@ impl TouchpadFilter {
 impl Filter for TouchpadFilter {
     fn process(
         &mut self,
-        event: InputEvent,
+        event: &mut InputEvent,
         _seat: Option<&Seat>,
-        info: Option<DeviceInfo>,
-    ) -> FilterResult {
-        match event {
-            InputEvent::PointerMotion {
-                device_index,
-                time_us,
-                dx,
-                dy,
-                dx_unaccelerated,
-                dy_unaccelerated,
-            } => {
-                if !dx.is_finite()
-                    || !dy.is_finite()
-                    || !dx_unaccelerated.is_finite()
-                    || !dy_unaccelerated.is_finite()
-                {
-                    self.reset_runtime_state();
-                    return smallvec![];
-                }
-
-                let res_x = Self::normalized_resolution(
-                    info.as_ref()
-                        .map(|i| i.x.resolution)
-                        .unwrap_or(NORMALIZED_TOUCHPAD_UNITS_PER_MM),
-                );
-                let res_y = Self::normalized_resolution(
-                    info.as_ref()
-                        .map(|i| i.y.resolution)
-                        .unwrap_or(NORMALIZED_TOUCHPAD_UNITS_PER_MM),
-                );
-
-                let mm_dx = dx / res_x;
-                let mm_dy = dy / res_y;
-                let norm_dx = mm_dx * NORMALIZED_TOUCHPAD_UNITS_PER_MM;
-                let norm_dy = mm_dy * NORMALIZED_TOUCHPAD_UNITS_PER_MM;
-                let norm_dx_unaccelerated =
-                    dx_unaccelerated / res_x * NORMALIZED_TOUCHPAD_UNITS_PER_MM;
-                let norm_dy_unaccelerated =
-                    dy_unaccelerated / res_y * NORMALIZED_TOUCHPAD_UNITS_PER_MM;
-
-                if !mm_dx.is_finite()
-                    || !mm_dy.is_finite()
-                    || !norm_dx.is_finite()
-                    || !norm_dy.is_finite()
-                    || !norm_dx_unaccelerated.is_finite()
-                    || !norm_dy_unaccelerated.is_finite()
-                {
-                    self.reset_runtime_state();
-                    return smallvec![];
-                }
-
-                self.cur_tracker = (self.cur_tracker + 1) & 15;
-                self.trackers[self.cur_tracker] = Tracker {
-                    dx: mm_dx,
-                    dy: mm_dy,
-                    time: time_us,
-                };
-
-                let velocity = self.calculate_velocity(time_us);
-
-                let current_accel_factor = self.accel_profile(velocity);
-                let mid_accel_factor = self.accel_profile((self.last_velocity + velocity) * 0.5);
-
-                let accel_factor =
-                    (current_accel_factor + self.last_accel_factor + 4.0 * mid_accel_factor)
-                        * (1.0 / 6.0);
-                if !accel_factor.is_finite() {
-                    self.reset_runtime_state();
-                    return smallvec![];
-                }
-
-                self.last_velocity = velocity;
-                self.last_accel_factor = current_accel_factor;
-                let out_dx = norm_dx * accel_factor;
-                let out_dy = norm_dy * accel_factor;
-                if !out_dx.is_finite() || !out_dy.is_finite() {
-                    self.reset_runtime_state();
-                    return smallvec![];
-                }
-
-                smallvec![InputEvent::PointerMotion {
-                    device_index,
-                    time_us,
-                    dx: out_dx,
-                    dy: out_dy,
-                    dx_unaccelerated: norm_dx_unaccelerated,
-                    dy_unaccelerated: norm_dy_unaccelerated,
-                }]
-            }
-            InputEvent::DeviceRemoved { .. } => {
+        info: Option<&DeviceInfo>,
+    ) -> Step {
+        let InputEvent::PointerMotion {
+            time_us,
+            dx,
+            dy,
+            dx_unaccelerated,
+            dy_unaccelerated,
+            ..
+        } = event
+        else {
+            if matches!(event, InputEvent::DeviceRemoved { .. }) {
                 self.reset_runtime_state();
-                smallvec![event]
             }
-            _ => smallvec![event],
+            return Step::Keep;
+        };
+
+        let time_us = *time_us;
+        let res_x = Self::normalized_resolution(
+            info.map(|i| i.x.resolution)
+                .unwrap_or(NORMALIZED_TOUCHPAD_UNITS_PER_MM),
+        );
+        let res_y = Self::normalized_resolution(
+            info.map(|i| i.y.resolution)
+                .unwrap_or(NORMALIZED_TOUCHPAD_UNITS_PER_MM),
+        );
+
+        let mm_dx = *dx / res_x;
+        let mm_dy = *dy / res_y;
+        let norm_dx = mm_dx * NORMALIZED_TOUCHPAD_UNITS_PER_MM;
+        let norm_dy = mm_dy * NORMALIZED_TOUCHPAD_UNITS_PER_MM;
+        let norm_dx_unaccelerated = *dx_unaccelerated / res_x * NORMALIZED_TOUCHPAD_UNITS_PER_MM;
+        let norm_dy_unaccelerated = *dy_unaccelerated / res_y * NORMALIZED_TOUCHPAD_UNITS_PER_MM;
+
+        if !norm_dx.is_finite()
+            || !norm_dy.is_finite()
+            || !norm_dx_unaccelerated.is_finite()
+            || !norm_dy_unaccelerated.is_finite()
+        {
+            self.reset_runtime_state();
+            return Step::Suppress;
         }
+
+        self.cur_tracker = (self.cur_tracker + 1) & 15;
+        self.trackers[self.cur_tracker] = Tracker {
+            dx: mm_dx,
+            dy: mm_dy,
+            time: time_us,
+        };
+
+        let velocity = self.calculate_velocity(time_us);
+        let current_accel_factor = self.accel_profile(velocity);
+        let mid_accel_factor = self.accel_profile((self.last_velocity + velocity) * 0.5);
+        let accel_factor =
+            (current_accel_factor + self.last_accel_factor + 4.0 * mid_accel_factor) * (1.0 / 6.0);
+        if !accel_factor.is_finite() {
+            self.reset_runtime_state();
+            return Step::Suppress;
+        }
+
+        self.last_velocity = velocity;
+        self.last_accel_factor = current_accel_factor;
+        *dx = norm_dx * accel_factor;
+        *dy = norm_dy * accel_factor;
+        *dx_unaccelerated = norm_dx_unaccelerated;
+        *dy_unaccelerated = norm_dy_unaccelerated;
+        Step::Keep
     }
 }
 
@@ -241,7 +212,7 @@ impl Filter for TouchpadFilter {
 mod tests {
     use {
         super::*,
-        crate::{backend::AxisInfo, events::DevIndex},
+        crate::{backend::AxisInfo, events::DevIndex, processing::TestFilterExt},
     };
 
     fn mock_info(res: f64) -> DeviceInfo {
@@ -283,8 +254,8 @@ mod tests {
             dy_unaccelerated: 0.0,
         };
 
-        let r1 = f1.process(e1, None, Some(mock_info(10.0)));
-        let r2 = f2.process(e2, None, Some(mock_info(100.0)));
+        let r1 = f1.run(e1, None, Some(&mock_info(10.0)));
+        let r2 = f2.run(e2, None, Some(&mock_info(100.0)));
 
         if let (
             InputEvent::PointerMotion { dx: dx1, .. },

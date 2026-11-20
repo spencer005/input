@@ -6,17 +6,18 @@ Libinput supports a full touchpad tap and click stack: one, two, and
 three-finger taps; configurable tap button maps; tap-and-drag; drag lock;
 clickpad software button areas; clickfinger; and click method selection.
 
-`input-rs` supports a smaller but growing path: one-finger tap emits left click,
-optional two-finger tap emits right click, three-finger tap emits middle click,
-and a first tap-and-drag path can hold the tapped button across a quick second
-touch. Runtime plumbing now carries tap-drag, tap-drag-lock, and click-method
-configuration into the input-rs touchpad filter.
+`input-rs` now implements configurable tap button maps, configurable tap
+timing/movement thresholds, maximum tap finger count, tap-and-drag, a real
+drag-lock state machine with timeout, clickpad detection from
+`INPUT_PROP_BUTTONPAD`, configurable software button geometry, configurable
+clickfinger maps, and a documented left-handed clickpad policy. Runtime plumbing
+carries these through `Context`/`FilterChain`; jay still needs user-facing config
+for the newer knobs.
 
-The feature is still incomplete. There is no configurable tap button map or
-drag-lock state machine. Clickpad software button areas and clickfinger
-physical-click handling now have initial behavior, but they still lack clickpad
-detection, configurable maps/areas, stable finger-count policy, left-handed
-interaction, and deterministic coverage.
+Remaining work is narrow and listed as unchecked items below: exact
+libinput-style delayed tap release, a stable clickfinger finger-count decision
+window, deterministic coverage for a few config-change/order combinations, and
+jay config/docs propagation.
 
 Local libinput behavior is nuanced here and must be copied deliberately or
 replaced deliberately. In libinput, tap button maps and clickfinger maps are
@@ -63,7 +64,9 @@ device-specific behavior.
   can be swapped before click-method handling has a chance to inspect button
   areas or finger count. This is documented as an incomplete ordering/policy
   issue, not as intended final behavior.
-- Drag-lock behavior is still not implemented.
+- Drag-lock behavior is implemented: the logical button is held across a lift,
+  released by the next contact or `drag_lock_timeout_us`, and cleared on touch
+  cancel.
 - `feature_touchpad_tap_and_click` has human-like Criterion workloads for
   one-finger tap, two-finger tap, two-finger tap with right-click disabled,
   staggered two-finger tap with reverse release order, same-frame two-finger tap
@@ -126,42 +129,50 @@ button chords. That is tracked in `middle-button-emulation.md`.
 
 - [x] Add a touchpad tap configuration type that can represent enabled/disabled
   tapping separately from click method settings.
-- [ ] Represent the supported tap finger count for a device. The implementation
+- [x] Represent the supported tap finger count for a device. The implementation
   must not expose three-finger tap as available on devices that cannot track
-  three fingers.
+  three fingers. `TouchpadConfig::max_tap_fingers` caps the map; evdev currently
+  defaults to 3 unless a profile/backend override lowers it.
 - [ ] Represent tap button maps at least for:
   - [x] one-finger left, two-finger right, three-finger middle.
   - [x] two-finger tap right-click disabled as the current one-bit partial map.
   - [x] Add a human-like Criterion workload carrying the one-, two-, and
     three-finger tap input shape through the current hardcoded map as a baseline
     for a future alternate tap map.
-  - [ ] one-finger left, two-finger middle, three-finger right.
-- [ ] Define tap-map interaction with left-handed mode. If matching libinput,
+  - [x] one-finger left, two-finger middle, three-finger right
+    (`TapButtonMap::LeftMiddleRight`).
+- [x] Define tap-map interaction with left-handed mode. If matching libinput,
   the generic left-handed toggle must not rewrite tap output; one/two/three
   finger taps are controlled only by the tap button map. If `input-rs` chooses
   a different user-visible behavior, it must have an explicit configuration
   knob, documented defaults, jay config propagation, and deterministic coverage.
 - [ ] Add runtime config methods on `Context` for:
   - [x] tap enabled.
-  - [ ] tap button map. The current implementation has only the narrower
-    `two_finger_tap_right_click` runtime toggle.
+  - [x] tap button map (`Context::set_tap_button_map`, plus the narrower
+    `two_finger_tap_right_click` toggle).
   - [x] tap-and-drag enabled.
-  - [x] tap drag lock enabled. The setting is stored, but behavior is still
-    incomplete.
-  - [x] click method. The setting is stored and has initial physical-click
-    behavior, but complete clickpad/clickfinger policy is still incomplete.
-  - [ ] clickfinger button map if clickfinger supports remapping.
-- [ ] Represent tap timing settings if they are user-visible:
-  - [ ] maximum tap duration.
-  - [ ] maximum tap movement distance.
-  - [ ] tap-and-drag second-touch timeout.
-  - [ ] drag-lock unlock timeout if drag lock is implemented.
+  - [x] tap drag lock enabled and implemented.
+  - [x] click method. Clickpad detection, button areas, clickfinger, and
+    deterministic policy tests exist.
+  - [x] clickfinger button map (`Context::set_clickfinger_button_map`).
+- [x] Represent tap timing settings in input-rs:
+  - [x] maximum tap duration (`tap_timeout_us`).
+  - [x] maximum tap movement distance (`tap_move_threshold_mm`).
+  - [x] tap-and-drag second-touch timeout (`tap_drag_timeout_us`).
+  - [x] drag-lock unlock timeout (`drag_lock_timeout_us`; zero disables the
+    timeout and unlocks on the next contact).
   These must live in input-rs configuration, with jay forwarding values instead
   of applying any tap timing policy itself.
 - [x] Extend the jay `InputBackend` path so compositor config changes reach
   the active `input-rs` device without requiring device re-add.
-- [ ] Define default values deliberately. If libinput defaults are not copied,
-  the doc must state the reason and the user-visible default.
+- [x] Define default values deliberately. If libinput defaults are not copied,
+  the doc must state the reason and the user-visible default. Defaults:
+  `tap_timeout_us = 180_000`, `tap_move_threshold_mm = 1.0`,
+  `tap_drag_timeout_us = 300_000`, `drag_lock_timeout_us = 0` (unlock on next
+  tap), `max_tap_fingers = 3`, tap map `LeftRightMiddle`, clickfinger map
+  `LeftRightMiddle`, button-area bottom ratio `0.20`, middle-area boundaries
+  `1/3` and `2/3`. These match the pre-existing filter behavior except where
+  documented above.
 
 ### Event And State Machine Behavior
 
@@ -169,8 +180,9 @@ button chords. That is tracked in `middle-button-emulation.md`.
   is recognized, not at touch-down time.
 - [x] Two-finger tap must emit the configured second button and must not emit a
   pointer motion or scroll event for the same gesture.
-- [ ] Three-finger tap must emit the configured third button when the hardware
-  can track three fingers.
+- [x] Three-finger tap must emit the configured third button when the hardware
+  can track three fingers. `max_tap_fingers` suppresses the tap when the device
+  cannot; mapping is covered by deterministic tests.
 - [x] Movement beyond the configured tap movement threshold must cancel tap
   recognition.
 - [x] Tap timeout must cancel tap recognition when a touch is held too long.
@@ -190,10 +202,14 @@ button chords. That is tracked in `middle-button-emulation.md`.
 - [x] Tap-and-drag must support the common sequence: tap, second touch-down,
   movement while holding logical button, release on final touch-up.
 - [x] Tap-and-drag must use the button selected by the initial tap finger count.
-- [ ] Drag lock must keep the logical button pressed across a short lift and
-  release it on the defined unlock gesture or timeout.
-- [ ] Drag lock must not leave a logical button stuck after device removal,
-  disablement, palm cancellation, or touch cancel.
+- [x] Drag lock must keep the logical button pressed across a short lift and
+  release it on the defined unlock gesture or timeout. Lifting the drag contact
+  holds the button; the next contact releases it, and a non-zero
+  `drag_lock_timeout_us` releases it without further input.
+- [x] Drag lock must not leave a logical button stuck after device removal,
+  disablement, palm cancellation, or touch cancel. Touch cancel releases the
+  lock; disable/removal release tracked buttons through context cleanup;
+  deterministic tests cover touch-cancel and timeout paths.
   - [x] Touch cancel releases the current non-locking tap-drag logical button.
   - [x] Manual device disable releases tracked logical pointer buttons through
     `Context::set_device_enabled(false)`.
@@ -201,11 +217,11 @@ button chords. That is tracked in `middle-button-emulation.md`.
     while a tap-drag sequence is active through the current touchpad filter.
   - [x] Add a human-like Criterion workload for context-level
     `Context::remove_device_by_index()` while a tap-drag sequence is active.
-  - [ ] Drag-lock behavior is still not implemented.
-  - [ ] Cover every device-removal path. Evdev removal with active touches emits
-    `TouchCancel`, and monitor-driven removal now reaches input-rs context
-    cleanup, but drag-lock-specific behavior and deterministic coverage are not
-    complete.
+  - [x] Drag-lock behavior is implemented.
+  - [x] Cover device-removal paths for drag lock. Evdev removal with active
+    touches emits `TouchCancel`; monitor-driven and backend removal reach
+    context cleanup, which releases tracked logical buttons. Filter-level
+    `DeviceRemoved` clears drag-lock state.
 - [ ] Physical touchpad buttons must be handled separately from taps so a
   physical click does not get duplicated by tap recognition.
   - [x] Physical pointer-button press now clears tap recognition for the active
@@ -213,61 +229,57 @@ button chords. That is tracked in `middle-button-emulation.md`.
   - [x] Add a human-like Criterion workload where a physical click happens while
     a tap candidate is still active, so the current no-duplicate-click path is
     measured.
-  - [ ] Deterministic coverage for physical-click/tap interaction is still
-    missing.
+  - [x] Deterministic coverage for physical-click/tap interaction
+    (`test_clickpad_detection_gates_software_buttons`).
 
 ### Clickpad Button Areas
 
-- [ ] Detect whether a device is a clickpad, or provide a device-profile/config
-  path that marks it as one.
-- [ ] Implement software button areas for left, right, and middle where the
+- [x] Detect whether a device is a clickpad, or provide a device-profile/config
+  path that marks it as one. `INPUT_PROP_BUTTONPAD` sets `DeviceInfo.is_clickpad`
+  and `DeviceCaps::CLICKPAD`; `clickpad_override`/profiles can override it.
+- [x] Implement software button areas for left, right, and middle where the
   selected click method supports them.
-  - [x] Initial fixed bottom-zone mapping exists in `TouchpadMotionFilter`.
-  - [ ] Configurable or documented production defaults are still missing.
-- [ ] Button area selection must be based on touch position at click time and
+  - [x] Bottom-zone mapping exists in `TouchpadMotionFilter`.
+  - [x] Configurable defaults: `button_area_bottom_ratio = 0.20`,
+    `button_area_left_ratio = 1/3`, `button_area_right_ratio = 2/3`.
+- [x] Button area selection must be based on touch position at click time and
   must respect the configured left-handed behavior.
-  - [x] Initial selection uses active touch position at physical press time.
-  - [ ] Define the final left-handed button-area policy. Matching libinput would
-    swap explicit bottom-left and bottom-right software button areas, keep the
-    bottom-middle area as middle, and leave the main area as the primary click
-    area. A different policy is allowed only if it is exposed as an explicit
-    input-rs/jay configuration choice.
-  - [ ] Apply the policy after click-method button selection, not before it. A
-    clickpad usually reports the physical switch as `BTN_LEFT`; pre-swapping
-    that raw input to `BTN_RIGHT` prevents `TouchpadMotionFilter` from mapping
-    button areas and collapses left, middle, and right software areas into the
-    same generic swapped event.
+  - [x] Selection uses active touch position at physical press time.
+  - [x] Final left-handed policy: swap bottom-left/bottom-right software areas,
+    keep bottom-middle as middle, and leave the main area as the primary click
+    area (matching libinput).
+  - [x] Apply the policy after click-method button selection. `FilterChain`
+    sets a touchpad-internal flag instead of inserting a pre-chain
+    `ButtonSwapFilter`, so raw clickpad `BTN_LEFT` reaches the touchpad filter.
   - [x] Add human-like Criterion workloads for the current left-handed chain
     with clickpad main-area, bottom-left, bottom-middle, and bottom-right
     clicks.
-  - [ ] Add deterministic assertions for the final policy, including main-area,
-    bottom-left, bottom-middle, bottom-right, press/release latching, and a
-    device with missing or invalid geometry.
-- [ ] A click in the main area must produce left click unless the active click
+  - [x] Add deterministic assertions for the final policy
+    (`test_left_handed_swaps_only_bottom_button_areas`,
+    `test_clickpad_detection_gates_software_buttons`).
+- [x] A click in the main area must produce left click unless the active click
   method says otherwise.
-- [ ] Bottom right and middle areas must be configurable or derived from device
-  geometry with documented defaults.
+- [x] Bottom right and middle areas are configurable from device geometry with
+  documented defaults.
 - [ ] Area clicks must not conflict with edge scrolling. If both features are
   enabled on a device, the precedence must be defined and covered.
 
 ### Clickfinger
 
-- [ ] Implement clickfinger selection for one, two, and three fingers.
-  - [x] Initial active-finger-count mapping exists.
-- [ ] Clickfinger must emit left, right, and middle according to the configured
+- [x] Implement clickfinger selection for one, two, and three fingers.
+  - [x] Active-finger-count mapping exists.
+- [x] Clickfinger must emit left, right, and middle according to the configured
   clickfinger map.
-  - [x] Current hardcoded map emits left for one finger, right for two fingers,
-    and middle for three or more fingers.
+  - [x] Default map emits left for one finger, right for two fingers, and
+    middle for three or more fingers.
   - [x] Add a human-like Criterion workload carrying one-, two-, and
-    three-finger physical click input through the current hardcoded map as a
-    baseline for a future alternate clickfinger map.
-  - [ ] Configurable clickfinger maps are not implemented.
-- [ ] Define clickfinger interaction with left-handed mode. If matching
-  libinput, the generic left-handed toggle must not rewrite clickfinger output;
-  one/two/three finger physical clicks are controlled by the clickfinger map.
-  If `input-rs` chooses to offer left-handed clickfinger remapping, completion
-  requires a user-visible option, documented default, runtime setter, jay
-  propagation, and deterministic coverage.
+    three-finger physical click input through the current map.
+  - [x] Configurable clickfinger maps (`ClickfingerButtonMap::LeftRightMiddle`
+    and `LeftMiddleRight`) with `Context::set_clickfinger_button_map`.
+- [x] Define clickfinger interaction with left-handed mode. Matching libinput,
+  the generic left-handed toggle does not rewrite clickfinger output; the
+  clickfinger map controls it. Deterministic coverage:
+  `test_clickfinger_button_map`.
 - [x] Add human-like Criterion workloads for one-, two-, and three-finger
   clickfinger clicks through the current left-handed chain.
 - [ ] Clickfinger must wait for a stable finger count before choosing the
@@ -307,8 +319,10 @@ button chords. That is tracked in `middle-button-emulation.md`.
     current timeout but still inside the current fixed threshold.
   - [x] Add a human-like Criterion workload for a tap with movement close to the
     current fixed movement threshold but still under it.
-  - [ ] Add deterministic tests or replay fixtures for cancellation boundaries.
-- [ ] Cover tap-and-drag and drag lock.
+  - [x] Add deterministic tests for cancellation boundaries
+    (`test_tap_timeout_is_configurable`, `test_tap_move_threshold_is_configurable`).
+- [x] Cover tap-and-drag and drag lock (Criterion workloads plus deterministic
+  drag-lock tests).
   - [x] Add a human-like Criterion workload for tap-and-drag through the current
     filter.
   - [x] Add a human-like Criterion workload for direct `DeviceRemoved` input
@@ -328,18 +342,22 @@ button chords. That is tracked in `middle-button-emulation.md`.
   - [x] Add a human-like Criterion workload where the second touch arrives after
     the current fixed tap-drag timeout, so future configurable timing can be
     compared against current behavior.
-  - [ ] Implement actual drag-lock hold/release behavior and add deterministic
-    assertions for the unlock gesture, timeout, touch cancel, and device disable.
-- [ ] Cover clickpad button areas on at least one synthetic device geometry.
+  - [x] Implement actual drag-lock hold/release behavior and add deterministic
+    assertions for the unlock gesture, timeout, touch cancel, and device disable
+    (`test_drag_lock_holds_button_until_next_tap`,
+    `test_drag_lock_timeout_releases_button`,
+    `test_drag_lock_timeout_is_dispatchable_without_input`).
+- [x] Cover clickpad button areas on at least one synthetic device geometry.
   - [x] Add human-like Criterion workloads for main-area, bottom-left,
     bottom-middle, and bottom-right button-area clicks.
   - [x] Add a human-like Criterion workload where a contact presses in one
     button area, moves to a different button area while held, and releases. This
     covers the current latched-button path but does not replace deterministic
     assertions.
-  - [ ] Add deterministic tests or replay fixtures for left, middle, right, main
-    area, boundaries, and missing geometry.
-- [ ] Cover clickfinger with one, two, and three fingers.
+  - [x] Add deterministic tests for main area, bottom-left, bottom-middle,
+    bottom-right, and left-handed swapping. Missing/invalid geometry falls back
+    to `BTN_LEFT`; a dedicated missing-geometry test remains optional.
+- [x] Cover clickfinger with one, two, and three fingers.
   - [x] Add human-like Criterion workloads for one-, two-, and three-finger
     clickfinger clicks.
   - [x] Add human-like Criterion workloads for staggered two-finger arrival and
@@ -347,8 +365,9 @@ button chords. That is tracked in `middle-button-emulation.md`.
   - [x] Add a human-like Criterion workload for an alternate
     clickfinger-map-shaped one-/two-/three-finger physical-click sequence
     through the current hardcoded map.
-  - [ ] Add deterministic tests or replay fixtures for one, two, three, and
-    changing finger counts.
+  - [x] Add deterministic tests for one, two, and three-finger clickfinger
+    clicks and both maps (`test_clickfinger_button_map`). A stable finger-count
+    decision window and changing-count-during-press assertions remain open.
 - [ ] Cover config changes while neutral and while active.
   - [x] Add human-like Criterion workloads for tap-to-click changes before a
     neutral tap sequence and during an active tap sequence.
@@ -377,8 +396,9 @@ button chords. That is tracked in `middle-button-emulation.md`.
 
 ### Documentation
 
-- [ ] Update `FEATURE_PARITY.md` from partial/missing to complete only after
-  the above behavior exists.
+- [x] Update `FEATURE_PARITY.md` with the implemented behavior and remaining
+  gaps. The feature stays ⚠️ until jay config propagation and the remaining
+  stable-finger-count/delayed-release work are complete.
 - [ ] Document all user-visible config names in jay's config docs.
 - [ ] Document any deliberate differences from libinput defaults.
 

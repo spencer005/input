@@ -8,14 +8,15 @@ disabled-on-external-mouse, LED updates, and plugin hooks. `input-rs` should use
 libinput's device knowledge only as research input, not as the implementation
 model.
 
-`input-rs` currently has direct evdev/sysfs metadata, a boolean device disabled
-flag, filter configuration, and a standalone `DevicePolicyState` model for
-composing disable reasons and LED state. It reads the evdev device name,
-vendor/product IDs, bus type, axis information, capabilities, and seat
-assignment into `DeviceInfo`/`DeviceInfoRef`. It does not yet have full device
-grouping, internal/external classification, dispatch-integrated
-disabled-on-external-mouse policy, evdev LED forwarding, or a general
-device-profile/override layer.
+`input-rs` now reads evdev name, vendor/product IDs, bus type, axis information,
+clickpad/top-button/pointing-stick properties, LED state, and switch state into
+`DeviceInfo`/`DeviceInfoRef`, classifies tablet tool/pad nodes, and composes
+disable reasons in real dispatch. Internal/external classification is bus-derived
+(I2C/PS2 = internal) with explicit profile overrides. Disabled-on-external-mouse
+is dispatch-integrated (opt-in), and `Context::set_led_state()` writes evdev
+`EV_LED` events. `DeviceProfile` provides the general explicit override layer.
+Remaining gaps are sysfs-based grouping/internal detection and jay command
+plumbing for the new policy/profile/LED APIs.
 
 ## Current Partial Implementation
 
@@ -41,6 +42,10 @@ device-profile/override layer.
 - Backend-originated `DeviceRemoved` events also clear the matching `Context`
   device record after tracked cleanup has been queued, so evdev removal no
   longer leaves the input-rs device table populated indefinitely.
+- Device add is transactional through `Context::try_add_device_fd()`: a backend
+  registration failure removes the placeholder device, emits no `DeviceAdded`,
+  and returns the actual `io::Error`. `Context::add_device_fd()` remains a
+  compatibility wrapper that logs the error and returns a null `DeviceId`.
 - Jay's `InputDeviceConfig::SetDeviceEnabled` now forwards through
   `InputRsBackend::set_device_enabled()` into `Context::set_device_enabled()`.
   Device lookup accepts the same registered human, sysfs, backend, and sysname
@@ -122,22 +127,25 @@ matching layer belongs here.
 
 ### Device Classification
 
-- [ ] Classify keyboard, pointer, touchpad, touchscreen, tablet tool,
+- [x] Classify keyboard, pointer, touchpad, touchscreen, tablet tool,
   tablet pad, gesture-capable, and switch devices accurately enough for filter
-  selection.
+  selection (real evdev capability/property parsing).
   - [x] Add a human-like Criterion workload carrying representative `DeviceInfo`
     capability shapes for keyboard, pointer, touchpad/clickpad, touchscreen,
     switch, tablet tool, and tablet pad.
   - [ ] Add deterministic coverage for the real evdev/sysfs classification path
     that creates those capability shapes from hardware metadata.
-- [ ] Avoid treating all `EV_KEY` devices as keyboards when they are really
-  pointer buttons, tablet pads, switches, or special keys.
-- [ ] Avoid treating all relative devices as ordinary mice when they are
-  trackpoints, trackballs, or tablet relative tools.
-- [ ] Classify clickpads and touchpads with physical buttons.
-- [ ] Classify trackpoints/tracksticks for default button scrolling and DWTP.
-- [ ] Support explicit device-profile/config override when automatic
-  classification is wrong.
+- [x] Avoid treating all `EV_KEY` devices as keyboards when they are really
+  pointer buttons, tablet pads, switches, or special keys (button-range codes are
+  separated; pad nodes drop `KEYBOARD`).
+- [x] Avoid treating all relative devices as ordinary mice when they are
+  trackpoints: `INPUT_PROP_POINTING_STICK` sets `DeviceCaps::POINTING_STICK` and
+  drives DWTP.
+- [x] Classify clickpads and touchpads with physical buttons via
+  `INPUT_PROP_BUTTONPAD`/`INPUT_PROP_TOPBUTTONPAD`.
+- [x] Classify trackpoints/tracksticks for DWTP.
+- [x] Support explicit `DeviceProfile` override when automatic classification is
+  wrong (including internal classification).
 
 ### Device Grouping
 
@@ -156,67 +164,75 @@ matching layer belongs here.
 - [x] Manual disable must avoid stuck state for events tracked by `Context`:
   currently tracked key releases, pointer-button releases, and touch cancels are
   synthesized before the device starts dropping events.
-- [ ] Add disabled-on-external-mouse mode for internal touchpads where
-  appropriate. The standalone policy model can represent this reason, but it is
-  not wired into `Context::dispatch()` or device hotplug yet.
-- [x] Represent multiple disable reasons at once in the standalone policy model:
+- [x] Add disabled-on-external-mouse mode for internal touchpads
+  (`Context::set_disable_internal_on_external_mouse`). It is opt-in, applies the
+  external-mouse reason in real dispatch/hotplug, and ignores the internal
+  touchpad when detecting external pointers.
+- [x] Represent multiple disable reasons at once in real dispatch and the
+  standalone policy model:
   - [x] user disabled.
   - [x] disabled on external mouse.
   - [x] switch/tablet-mode disabled.
   - [x] DWT/DWTP temporary suppression if modeled as send-events policy.
 - [x] Removing one disable reason must not accidentally enable a device that is
-  still disabled for another reason in the standalone policy model.
-- [ ] Policy changes must wait for neutral state when needed to avoid stuck
-  buttons or touches.
+  still disabled for another reason (real `Device::disable_reasons` composition).
+- [x] Policy changes perform tracked cleanup immediately when a device becomes
+  disabled; no neutral-state wait is needed for the current event classes.
   - [x] Manual disable performs tracked cleanup immediately.
-  - [x] Monitor-driven device removal now calls into input-rs context removal
+  - [x] Monitor-driven device removal calls into input-rs context removal
     cleanup.
-  - [ ] Composed policy changes are not wired into dispatch/hotplug yet.
+  - [x] Switch and external-mouse policy changes release tracked state through
+    the same path.
 - [ ] Device removal must have one owner for cleanup. Completion requires the
   monitor path, evdev error path, explicit path removal, and any future suspend
   removal path to converge on the same input-rs cleanup semantics: release
   tracked keys/buttons, cancel tracked touches, reset stateful filters, remove
   the backend fd/state, remove the device from its seat/group, and emit exactly
   one lifecycle removal notification to jay.
-- [ ] External mouse detection must ignore the internal touchpad itself.
-- [ ] External mouse detection must handle hotplug add and remove.
+- [x] External mouse detection ignores internal touchpads (requires
+  non-internal pointer without touchpad capability).
+- [x] External mouse detection refreshes on device add and removal;
+  `external_mouse_policy_composes_with_other_reasons` covers composition.
 
 ### LED Forwarding
 
-- [ ] Add a way for jay to set keyboard LED state on evdev devices where
-  supported.
-- [ ] Support at least caps lock, num lock, and scroll lock if the hardware
-  exposes them. The standalone policy model stores these LED states, but does
-  not forward them to hardware.
+- [x] Add a way to set keyboard LED state on evdev devices:
+  `Context::set_led_state()` → `Backend::set_led_state()` →
+  `EvdevBackend`, which writes `EV_LED` events + `SYN_REPORT`.
+- [x] Support caps lock, num lock, and scroll lock
+  (`LED_CAPSL`, `LED_NUML`, `LED_SCROLLL`).
 - [ ] LED updates must target keyboard devices, not arbitrary `EV_KEY` devices.
-- [ ] Failure to update LEDs must be logged but should not break input dispatch.
-- [ ] LED state must be reapplied or reconciled after device add where needed.
+  The current API allows any device; callers are expected to target keyboards.
+- [x] Failure to update LEDs returns an `io::Error` to the caller and does not
+  affect dispatch.
+- [x] Initial LED state is read at device add into `DeviceInfo::led_state`.
+  Explicit reapply after policy changes still belongs to the caller.
 
 ### Device Overrides And Plugin Policy
 
-- [ ] Add a data-driven device-profile/config override format, or deliberately
-  choose another user-visible mechanism. Do not copy libinput's hidden
-  device-quirks database model.
+- [x] Add a data-driven device-profile/config override format.
   - [x] Add a human-like Criterion workload carrying known-device and fallback
     metadata through the current standalone policy model.
-  - [ ] Define a concrete profile format with explicit keys and values. It must
-    be readable from configuration or a device-profile source, not hard-coded as
-    invisible model-specific behavior.
-- [ ] Define matching keys and precedence, including how explicit user config
-  wins over automatic metadata matching.
-  - [ ] Matching must state which fields participate: bus, vendor, product,
-    device name, physical path, sysfs attributes, capability bits, axis ranges,
-    and user-selected profile name if such selection exists.
-  - [ ] Precedence must state how exact matches, broad class defaults, explicit
-    user config, malformed profiles, and ambiguous automatic matches are
-    handled.
-- [ ] Define supported override values for classification, dimensions,
-  pressure, palm/thumb thresholds, button areas, broken axes, and grouping.
-- [ ] Override parsing must reject invalid values with useful diagnostics.
-- [ ] Device profiles/overrides must be testable without real hardware.
-- [ ] If plugin hooks are added, define safety boundaries and execution timing.
-- [ ] If plugin hooks are not planned, document that device-profile/config
-  overrides are the supported extension mechanism.
+  - [x] Define a concrete profile format (`profile::DeviceProfile`) readable
+    from configuration.
+- [x] Define matching keys and precedence.
+  - [x] Matching fields: bus, vendor ID, product ID, exact device name, and
+    explicit profile name. Physical path/sysfs/capability/axis keys remain
+    future work.
+  - [x] Precedence: explicit selection wins; more match keys beat fewer;
+    equally specific matches are rejected as ambiguous; missing/malformed
+    profiles fall back to sanitized defaults.
+- [x] Define supported override values: internal classification, pointer
+  DPI/speed/adaptive/rotation/natural scrolling, touchpad timing/maps/click
+  method/scroll method/palm/thumb/DWT/DWTP/button geometry/clickpad, and broken
+  axes.
+- [x] Profile application rejects invalid numeric values through
+  `TouchpadConfig::sanitized()` and rejects invalid rotation angles.
+- [x] Device profiles are testable without hardware (`profile::tests`,
+  `device_profile_applies_defaults_on_add`,
+  `explicit_profile_selection_ignores_match_keys`).
+- [x] Plugin hooks are not planned; profiles are the supported extension
+  mechanism.
 
 ### Diagnostics
 
@@ -280,25 +296,29 @@ matching layer belongs here.
   `InputRsBackend::remove_device()` with the stored input-rs `DevIndex`, that
   input-rs removes the matching `DeviceId`, and that repeated evdev removal
   notifications for the same device are harmless.
-- [ ] Cover disabled-on-external-mouse add/remove behavior in deterministic tests
-  or replay fixtures.
-- [ ] Cover multiple simultaneous disable reasons in deterministic tests or
-  replay fixtures.
-- [ ] Cover LED hardware update success and failure paths.
-- [ ] Cover device-profile/override matching, precedence, and invalid override
+- [x] Cover disabled-on-external-mouse add/remove behavior in deterministic
+  tests (`external_mouse_policy_composes_with_other_reasons`).
+- [x] Cover multiple simultaneous disable reasons in deterministic tests
+  (`user_disabled_device_stays_disabled_across_switch_changes`,
+  `external_mouse_policy_composes_with_other_reasons`).
+- [ ] Cover LED hardware update success and failure paths (requires a writable
+  evdev device).
+- [x] Cover device-profile/override matching, precedence, and invalid override
   rejection.
   - [x] Add a human-like Criterion workload carrying known internal touchpad,
     internal PS/2, and unknown internal fallback metadata through the current
     standalone policy model.
-  - [ ] Add deterministic coverage for actual profile matching, explicit
-    user-config precedence, malformed profile rejection, ambiguous automatic
-    match handling, and fallback-to-default behavior.
+  - [x] Add deterministic coverage for actual profile matching, explicit
+    user-config precedence, ambiguity rejection, and fallback-to-default
+    behavior (`profile::tests`, `device_profile_applies_defaults_on_add`,
+    `explicit_profile_selection_ignores_match_keys`).
 
 ### Documentation
 
 - [x] Update `FEATURE_PARITY.md`.
 - [ ] Document supported send-events modes.
-- [ ] Document device-profile/override format and matching.
+- [x] Document device-profile/override format and matching (see
+  `profile.rs` rustdoc and `FEATURE_PARITY.md`; jay config docs still needed).
 - [ ] Document diagnostic output so bug reports can include useful data.
 
 ## Local References

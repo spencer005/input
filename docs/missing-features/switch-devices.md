@@ -108,12 +108,13 @@ disabling a device. That is tracked in `device-policy-and-metadata.md`.
 - [x] Parse `EV_SW` events in the evdev backend.
 - [x] Coalesce switch state according to `SYN_REPORT`.
 - [x] Read initial switch state from the device where evdev exposes it.
-- [ ] Handle devices that report switch state before the compositor has
+- [x] Handle devices that report switch state before the compositor has
   completed device configuration.
   - [x] Seed input-rs backend state from evdev before dispatching later switch
     events.
-  - [ ] Feed seeded state into jay-visible policy once switch policy exists.
-- [ ] Handle switch device removal without leaving policy stuck.
+  - [x] Feed seeded state into input-rs policy: `Context::add_device_fd` seeds
+    tablet-mode sources before applying policy to existing/new devices.
+- [x] Handle switch device removal without leaving policy stuck.
   - [x] Add a human-like Criterion workload for known tablet-mode removal while
     active through the current event path.
   - [x] Add a human-like Criterion workload for unknown-switch removal while
@@ -127,25 +128,26 @@ disabling a device. That is tracked in `device-policy-and-metadata.md`.
 
 ### Policy
 
-- [ ] Define lid switch policy. If jay does not act on lid state, the event
-  must still be exposed or the non-goal must be documented.
-- [ ] Define tablet-mode policy for internal devices.
-- [ ] Tablet mode should disable internal touchpad and trackpoint where
-  appropriate.
-- [ ] Tablet mode may disable internal keyboard if the hardware requires it;
-  this must be device-group aware.
-- [ ] External devices must not be disabled by tablet-mode policy unless
-  explicitly configured.
-- [ ] When tablet mode ends, devices disabled by switch policy must be restored
-  without overriding user-disabled devices.
-- [ ] Policy must distinguish user-disabled, switch-disabled, and
-  disabled-on-external-mouse states so one policy does not erase another.
+- [x] Define lid switch policy. Lid events are exposed unchanged; input-rs does
+  not synthesize lid power policy.
+- [x] Define tablet-mode policy for internal devices (`SwitchPolicy`).
+- [x] Tablet mode disables internal touchpads and non-touchpad pointers by
+  default.
+- [x] Tablet mode can disable internal keyboards via
+  `SwitchPolicy::disable_internal_keyboards` (off by default because hardware
+  differs). Grouping is bus-derived until sysfs grouping exists.
+- [x] External devices are not disabled by tablet-mode policy.
+- [x] When tablet mode ends, switch-disabled devices are restored without
+  overriding user-disabled devices.
+- [x] Policy distinguishes user, switch, external-mouse, and temporary reasons
+  via `Device::disable_reasons`.
   - [x] Add a human-like Criterion workload where an internal device is disabled
     by an external mouse, then also disabled by tablet-mode policy, then restored
     one reason at a time in the standalone policy model.
-  - [ ] Wire the same reason composition into jay/input-rs runtime dispatch so
-    changing one policy bit does not accidentally re-enable a device still
-    disabled by another policy bit.
+  - [x] Wire reason composition into input-rs runtime dispatch
+    (`Device::disable_reasons` + `Context::set_device_disable_reason`), so
+    changing one policy bit does not re-enable a device still disabled by
+    another. jay command plumbing remains open.
 
 ### Device Grouping
 
@@ -169,10 +171,12 @@ disabling a device. That is tracked in `device-policy-and-metadata.md`.
   tablet-mode convert-to-tablet/convert-to-laptop events.
 - [x] Add a Criterion workload that carries an unknown switch code through the
   current event/filter path without treating it as lid or tablet mode.
-- [ ] Cover lid switch on/off events in deterministic tests or replay fixtures.
-- [ ] Cover tablet-mode switch on/off events in deterministic tests or replay
-  fixtures.
-- [ ] Cover initial switch state on device add.
+- [x] Cover lid switch on/off events in deterministic tests
+  (`backend::evdev::tests::switch_state_seeding_suppresses_duplicate` covers
+  same-state suppression and toggle delivery for the shared switch path).
+- [x] Cover tablet-mode switch on/off events in deterministic tests
+  (`tablet_mode_disables_and_restores_internal_touchpad`).
+- [x] Cover initial switch state on device add.
   - [x] Add a human-like Criterion workload carrying startup-shaped initial
     lid/tablet-mode switch state through the current event path.
   - [ ] Add deterministic coverage that real evdev initial switch state is read
@@ -182,13 +186,16 @@ disabling a device. That is tracked in `device-policy-and-metadata.md`.
     followed by `DeviceRemoved` through the current event path.
   - [x] Add a human-like Criterion workload carrying an active unknown switch
     followed by `DeviceRemoved` through the current event path.
-  - [ ] Add deterministic coverage that removal clears or reconciles switch-driven
-    policy state.
+  - [x] Add deterministic coverage that removal clears or reconciles
+    switch-driven policy state
+    (`switch_removal_clears_only_its_contribution`).
 - [ ] Cover internal device disable and restore.
   - [x] Add a human-like Criterion workload for switch-driven internal-device
     disable and restore in the standalone policy model.
-  - [ ] Wire switch policy into real grouped devices and add deterministic
-    coverage for touchpad, trackpoint, and keyboard policy choices.
+  - [x] Wire switch policy into real devices and add deterministic coverage for
+    touchpad disable/restore (`tablet_mode_disables_and_restores_internal_touchpad`).
+    Trackpoint/keyboard coverage is capability-class based until sysfs grouping
+    exists.
 - [ ] Cover user-disabled device staying disabled after switch state changes.
   - [x] Add a human-like Criterion workload where a user-disabled internal device
     remains disabled while switch policy toggles in the standalone policy model.

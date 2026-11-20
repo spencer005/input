@@ -1,7 +1,6 @@
 use {
-    super::{Filter, FilterResult},
+    super::{Filter, Step},
     crate::{backend::DeviceInfo, events::InputEvent, state::Seat},
-    smallvec::smallvec,
 };
 
 pub struct ConstantAccelFilter {
@@ -15,31 +14,17 @@ impl ConstantAccelFilter {
 }
 
 impl Filter for ConstantAccelFilter {
+    #[inline]
     fn process(
         &mut self,
-        event: InputEvent,
+        event: &mut InputEvent,
         _seat: Option<&Seat>,
-        _info: Option<DeviceInfo>,
-    ) -> FilterResult {
-        match event {
-            InputEvent::PointerMotion {
-                device_index,
-                time_us,
-                dx,
-                dy,
-                dx_unaccelerated,
-                dy_unaccelerated,
-            } => {
-                smallvec![InputEvent::PointerMotion {
-                    device_index,
-                    time_us,
-                    dx: dx * self.factor,
-                    dy: dy * self.factor,
-                    dx_unaccelerated: dx_unaccelerated,
-                    dy_unaccelerated: dy_unaccelerated,
-                }]
-            }
-            _ => smallvec![event],
+        _info: Option<&DeviceInfo>,
+    ) -> Step {
+        if let InputEvent::PointerMotion { dx, dy, .. } = event {
+            *dx *= self.factor;
+            *dy *= self.factor;
         }
+        Step::Keep
     }
 }

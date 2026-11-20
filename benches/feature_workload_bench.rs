@@ -12,8 +12,8 @@ use {
         backend::{AxisInfo, Backend, BusType, DeviceCaps, DeviceInfo},
         events::{
             DevIndex, InputEvent, ScrollSource, SwitchKind, TabletPadButtonData, TabletPadDialData,
-            TabletPadValueData, TabletToolAxisData, TabletToolButtonData, TabletToolProximityData,
-            TabletToolTipData, TouchToolType,
+            TabletPadValueData, TabletToolAxisData, TabletToolButtonData, TabletToolKind,
+            TabletToolProximityData, TabletToolTipData, TouchToolType,
         },
         policy::{DeviceMetadataProbe, DevicePolicyEvent, DevicePolicyState},
         processing::{
@@ -188,6 +188,7 @@ fn bench_seat(last_key_time: u64) -> Seat {
         name: "seat0".to_string(),
         devices: Vec::new(),
         last_key_time,
+        ..Default::default()
     }
 }
 
@@ -313,6 +314,7 @@ fn tablet_proximity(time_us: u64, x: f64, y: f64, in_range: bool) -> InputEvent 
         x,
         y,
         in_range,
+        tool: Some(TabletToolKind::Pen),
     }))
 }
 
@@ -699,7 +701,7 @@ fn run_touchpad_motion(events: &[InputEvent], config: TouchpadConfig, seat: Opti
     let mut score = 0u64;
 
     for event in events {
-        let out = filter.process(black_box(event.clone()), seat, Some(info.clone()));
+        let out = filter.run(black_box(event.clone()), seat, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -738,7 +740,7 @@ fn run_touchpad_motion_with_runtime_reset(
             filter.reset_runtime_state();
             score = score.wrapping_add(0x0d15_ab1e);
         }
-        let out = filter.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = filter.run(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -765,7 +767,7 @@ fn run_touchpad_motion_with_scroll_method_change(
             filter.set_scroll_method(changed);
             score = score.wrapping_add(0x5c20_11ed);
         }
-        let out = filter.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = filter.run(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -792,7 +794,7 @@ fn run_touchpad_motion_with_natural_scroll_change(
             filter.set_natural_scrolling(changed);
             score = score.wrapping_add(0x5c20_11e0);
         }
-        let out = filter.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = filter.run(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -819,7 +821,7 @@ fn run_touchpad_motion_with_tap_to_click_change(
             filter.set_tap_to_click(changed);
             score = score.wrapping_add(0x7a9_70c1);
         }
-        let out = filter.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = filter.run(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -846,7 +848,7 @@ fn run_touchpad_motion_with_two_finger_tap_right_click_change(
             filter.set_two_finger_tap_right_click(changed);
             score = score.wrapping_add(0x2f1_972);
         }
-        let out = filter.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = filter.run(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -873,7 +875,7 @@ fn run_touchpad_motion_with_click_method_change(
             filter.set_click_method(changed);
             score = score.wrapping_add(0xc11c_0000);
         }
-        let out = filter.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = filter.run(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -905,7 +907,7 @@ fn run_filter_chain_with_info(
     let mut score = 0u64;
 
     for event in events {
-        let out = chain.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = chain.process(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -953,7 +955,7 @@ fn run_filter_chain_with_calibration_change(
             chain.set_calibration_matrix(changed);
             score = score.wrapping_add(0xca11_b8a7);
         }
-        let out = chain.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = chain.process(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -983,7 +985,7 @@ fn run_filter_chain_with_button_scroll_change(
             chain.set_button_scroll(changed_enabled, changed_button, changed_lock);
             score = score.wrapping_add(0xb077_5c20);
         }
-        let out = chain.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = chain.process(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -1009,7 +1011,7 @@ fn run_filter_chain_with_middle_button_change(
             chain.set_middle_button_emulation(changed_enabled);
             score = score.wrapping_add(0x0b1d_0000);
         }
-        let out = chain.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = chain.process(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -1035,7 +1037,7 @@ fn run_filter_chain_with_debounce_change(
             chain.set_debounce(changed);
             score = score.wrapping_add(0xd3b0_0000);
         }
-        let out = chain.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = chain.process(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -1118,7 +1120,7 @@ fn run_mouse_profile_change(
             chain.set_mouse_profile(changed.clone());
             score = score.wrapping_add(0xa11c_0000);
         }
-        let out = chain.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = chain.process(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -1150,7 +1152,7 @@ fn run_mouse_speed_change(
             chain.set_mouse_speed_adjustment(changed_speed);
             score = score.wrapping_add(0x5eed_0000);
         }
-        let out = chain.process(black_box(event.clone()), None, Some(info.clone()));
+        let out = chain.process(black_box(event.clone()), None, Some(&info));
         score = score.wrapping_add(out.len() as u64);
         for event in &out {
             score = score.wrapping_add(event_score(event));
@@ -3366,6 +3368,7 @@ fn tablet_separate_tool_pad_touch_nodes_candidate() -> Vec<InputEvent> {
             x: 1100.0,
             y: 880.0,
             in_range: true,
+            tool: Some(TabletToolKind::Pen),
         })),
         InputEvent::TabletToolAxis(Box::new(TabletToolAxisData {
             device_index: DevIndex(0),
@@ -3439,6 +3442,7 @@ fn tablet_separate_tool_pad_touch_nodes_candidate() -> Vec<InputEvent> {
             x: 1160.0,
             y: 910.0,
             in_range: false,
+            tool: Some(TabletToolKind::Pen),
         })),
     ]
 }
@@ -3451,6 +3455,7 @@ fn tablet_touch_node_removed_while_group_active_candidate() -> Vec<InputEvent> {
             x: 1180.0,
             y: 860.0,
             in_range: true,
+            tool: Some(TabletToolKind::Pen),
         })),
         InputEvent::TabletToolAxis(Box::new(TabletToolAxisData {
             device_index: DevIndex(0),
@@ -3506,6 +3511,7 @@ fn tablet_touch_node_removed_while_group_active_candidate() -> Vec<InputEvent> {
             x: 1205.0,
             y: 882.0,
             in_range: false,
+            tool: Some(TabletToolKind::Pen),
         })),
     ]
 }
@@ -6926,3 +6932,52 @@ criterion_group!(
     bench_device_policy_and_metadata
 );
 criterion_main!(benches);
+
+trait ChainProcessExt {
+    fn process(
+        &mut self,
+        event: input_rs::events::InputEvent,
+        seat: Option<&input_rs::state::Seat>,
+        info: Option<&input_rs::backend::DeviceInfo>,
+    ) -> input_rs::processing::FilterResult;
+}
+
+impl ChainProcessExt for input_rs::processing::FilterChain {
+    fn process(
+        &mut self,
+        event: input_rs::events::InputEvent,
+        seat: Option<&input_rs::state::Seat>,
+        info: Option<&input_rs::backend::DeviceInfo>,
+    ) -> input_rs::processing::FilterResult {
+        let mut out = input_rs::processing::FilterResult::new();
+        self.process_into(event, seat, info, &mut out);
+        out
+    }
+}
+
+trait FilterRunExt {
+    fn run(
+        &mut self,
+        event: input_rs::events::InputEvent,
+        seat: Option<&input_rs::state::Seat>,
+        info: Option<&input_rs::backend::DeviceInfo>,
+    ) -> input_rs::processing::FilterResult;
+}
+
+impl<T: input_rs::processing::Filter> FilterRunExt for T {
+    fn run(
+        &mut self,
+        mut event: input_rs::events::InputEvent,
+        seat: Option<&input_rs::state::Seat>,
+        info: Option<&input_rs::backend::DeviceInfo>,
+    ) -> input_rs::processing::FilterResult {
+        use input_rs::processing::Step;
+        let mut out = input_rs::processing::FilterResult::new();
+        match input_rs::processing::Filter::process(self, &mut event, seat, info) {
+            Step::Keep => out.push(event),
+            Step::Suppress => {}
+            Step::FanOut(events) => out.extend(*events),
+        }
+        out
+    }
+}

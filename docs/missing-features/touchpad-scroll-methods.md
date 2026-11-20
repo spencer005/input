@@ -10,10 +10,11 @@ information.
 `input-rs` currently has two-finger touchpad scrolling, initial right/bottom edge
 scrolling, and wheel handling. It also has an initial `ButtonScrollFilter` that
 converts pointer motion into continuous `PointerScroll` events while a configured
-scroll button is active. It does not yet implement full public scroll-method
-selection through jay config, automatic trackpoint defaults, complete source
-classification, scroll speed configuration, circular scrolling, or coasting
-scroll.
+scroll button is active. Explicit scroll scaling and per-axis inversion are
+also available through `ScrollScaleFilter` / `Context::set_scroll_scale()`.
+It does not yet implement full public scroll-method selection, automatic
+trackpoint defaults, complete source classification, circular scrolling, or
+coasting scroll.
 
 ## Current Partial Implementation
 
@@ -206,19 +207,24 @@ level coasting.
 
 ### Advanced Scroll Extensions
 
-- [ ] Add an explicit scroll speed multiplier if `input-rs` owns scroll-speed
-  configuration.
+- [x] Add an explicit scroll speed multiplier if `input-rs` owns scroll-speed
+  configuration. Implemented as `ScrollScaleFilter` with independent x/y
+  factors; it applies to every `PointerScroll` source after button-scroll
+  generation and before/after natural inversion (multiplication commutes).
   - [x] Add a human-like Criterion workload carrying mixed slow and fast
     two-finger scroll motion through the current filter as a baseline for future
     multiplier behavior.
-  - [ ] Define whether the multiplier applies to finger, edge, button, wheel, or
-    all scroll sources.
-  - [ ] Define the order relative to natural scrolling: direction inversion and
-    magnitude scaling must each happen exactly once.
-  - [ ] Validate multiplier values. Completion requires documented min, max,
-    default, and behavior for zero, negative, non-finite, and extreme values.
-  - [ ] Add runtime input-rs configuration, jay forwarding, diagnostics, and
-    deterministic assertions for each supported source.
+  - [x] Define whether the multiplier applies to finger, edge, button, wheel, or
+    all scroll sources: every `PointerScroll` event.
+  - [x] Define the order relative to natural scrolling: canonical order is
+    button scroll → natural inversion → scroll scale; magnitude and direction
+    each apply once.
+  - [x] Validate multiplier values: non-finite factors fall back to 1.0;
+    positive scales, negative inverts, zero suppresses that axis; default is
+    (1.0, 1.0).
+  - [x] Add runtime input-rs configuration (`Context::set_scroll_scale`,
+    `FilterChain::set_scroll_scale`, profile defaults) and deterministic tests
+    for scaling, inversion, identity fallback, and source pass-through.
 - [ ] Add circular scrolling only if it is an intentional input-rs feature.
   - [x] Add a human-like Criterion workload carrying one-finger circular motion
     that starts near the right edge and moves around the touchpad center through

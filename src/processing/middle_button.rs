@@ -1,5 +1,5 @@
 use {
-    super::{Filter, FilterResult},
+    super::{Filter, FilterResult, Step},
     crate::{backend::DeviceInfo, events::InputEvent, state::Seat},
 };
 
@@ -26,6 +26,10 @@ pub struct MiddleButtonEmulationFilter {
     emulating: bool,
     left_down: bool,
     right_down: bool,
+    enabled: bool,
+    /// After disengaging during a chord, swallow the remaining physical
+    /// left/right releases so clients do not see releases without presses.
+    swallow_chord_releases: bool,
 }
 
 impl MiddleButtonEmulationFilter {
@@ -36,6 +40,8 @@ impl MiddleButtonEmulationFilter {
             emulating: false,
             left_down: false,
             right_down: false,
+            enabled: true,
+            swallow_chord_releases: false,
         }
     }
 
@@ -46,11 +52,29 @@ impl MiddleButtonEmulationFilter {
         }
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Disengage without removing the filter. Context flushes a pending press
+    /// and releases an active synthesized middle button before calling this.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if !enabled {
+            if self.emulating {
+                self.swallow_chord_releases = true;
+            }
+            self.emulating = false;
+            self.pending = None;
+        }
+        self.enabled = enabled;
+    }
+
     pub fn reset_runtime_state(&mut self) {
         self.pending = None;
         self.emulating = false;
         self.left_down = false;
         self.right_down = false;
+        self.swallow_chord_releases = false;
     }
 
     fn is_emulated_button(button: u32) -> bool {
@@ -173,11 +197,32 @@ impl MiddleButtonEmulationFilter {
 impl Filter for MiddleButtonEmulationFilter {
     fn process(
         &mut self,
-        event: InputEvent,
+        event: &mut InputEvent,
         _seat: Option<&Seat>,
-        _info: Option<DeviceInfo>,
-    ) -> FilterResult {
+        _info: Option<&DeviceInfo>,
+    ) -> Step {
         let mut out = FilterResult::new();
+
+        if self.swallow_chord_releases {
+            if let InputEvent::PointerButton {
+                button,
+                pressed: false,
+                ..
+            } = event
+            {
+                if matches!(*button, BTN_LEFT | BTN_RIGHT) {
+                    self.set_button_down(*button, false);
+                    if !self.left_down && !self.right_down {
+                        self.swallow_chord_releases = false;
+                    }
+                    return Step::Suppress;
+                }
+            }
+        }
+
+        if !self.enabled {
+            return Step::Keep;
+        }
 
         match event {
             InputEvent::PointerButton {
@@ -185,30 +230,113 @@ impl Filter for MiddleButtonEmulationFilter {
                 time_us,
                 button,
                 pressed,
-            } if Self::is_emulated_button(button) => {
-                if pressed {
-                    self.handle_press(device_index, time_us, button, &mut out);
+            } if Self::is_emulated_button(*button) => {
+                if *pressed {
+                    self.handle_press(*device_index, *time_us, *button, &mut out);
                 } else {
-                    self.handle_release(device_index, time_us, button, &mut out);
+                    self.handle_release(*device_index, *time_us, *button, &mut out);
                 }
+                Step::from_result(event, out)
             }
             InputEvent::Frame {
                 device_index,
                 time_us,
             } => {
-                self.flush_pending(time_us, false, &mut out);
-                out.push(InputEvent::Frame {
-                    device_index,
-                    time_us,
-                });
+                self.flush_pending(*time_us, false, &mut out);
+                if out.is_empty() {
+                    Step::Keep
+                } else {
+                    out.push(InputEvent::Frame {
+                        device_index: *device_index,
+                        time_us: *time_us,
+                    });
+                    Step::FanOut(Box::new(out))
+                }
             }
             other => {
                 let time_us = other.time_us();
                 self.flush_pending(time_us, true, &mut out);
-                out.push(other);
+                if out.is_empty() {
+                    Step::Keep
+                } else {
+                    out.push(other.clone());
+                    Step::FanOut(Box::new(out))
+                }
             }
         }
+    }
 
+    fn dispatch_timeout(&mut self, now_us: u64) -> FilterResult {
+        let mut out = FilterResult::new();
+        self.flush_pending(now_us, false, &mut out);
         out
+    }
+
+    fn next_timeout_us(&self) -> Option<u64> {
+        self.pending
+            .map(|pending| pending.time_us.saturating_add(self.timeout_us))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{events::DevIndex, processing::TestFilterExt},
+    };
+
+    fn press(time_us: u64, button: u32) -> InputEvent {
+        InputEvent::PointerButton {
+            device_index: DevIndex(0),
+            time_us,
+            button,
+            pressed: true,
+        }
+    }
+
+    fn release(time_us: u64, button: u32) -> InputEvent {
+        InputEvent::PointerButton {
+            device_index: DevIndex(0),
+            time_us,
+            button,
+            pressed: false,
+        }
+    }
+
+    fn buttons(events: &[InputEvent]) -> Vec<(u32, bool)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                InputEvent::PointerButton {
+                    button, pressed, ..
+                } => Some((*button, *pressed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chord_within_timeout_emits_only_middle() {
+        let mut filter = MiddleButtonEmulationFilter::new();
+        assert!(buttons(&filter.run(press(0, BTN_LEFT), None, None)).is_empty());
+        let out = filter.run(press(10, BTN_RIGHT), None, None);
+        assert_eq!(buttons(&out), vec![(BTN_MIDDLE, true)]);
+
+        let out = filter.run(release(20, BTN_RIGHT), None, None);
+        assert!(buttons(&out).is_empty());
+        let out = filter.run(release(30, BTN_LEFT), None, None);
+        assert_eq!(buttons(&out), vec![(BTN_MIDDLE, false)]);
+    }
+
+    #[test]
+    fn timer_deadline_flushes_pending_press_without_other_input() {
+        let mut filter = MiddleButtonEmulationFilter::new();
+        filter.run(press(1_000, BTN_LEFT), None, None);
+        assert_eq!(filter.next_timeout_us(), Some(1_000 + 50_000));
+
+        assert!(buttons(&filter.dispatch_timeout(1_001)).is_empty());
+        let out = filter.dispatch_timeout(51_001);
+        assert_eq!(buttons(&out), vec![(BTN_LEFT, true)]);
+        assert_eq!(filter.next_timeout_us(), None);
     }
 }

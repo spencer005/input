@@ -29,9 +29,19 @@ pointer configuration is replayed onto newly added devices.
   scaling; `MouseAccelProfile::Adaptive` applies the current velocity-based
   built-in curve; `MouseAccelProfile::Custom` applies a piecewise-linear
   speed-to-factor curve.
-- Custom profile points are represented as `(speed_mm_per_s, factor)` pairs and
-  are evaluated by linear interpolation. Speeds below the first point use the
-  first factor; speeds above the last point use the last factor.
+- Custom profile points are `(speed_mm_per_s, factor)` pairs and are validated
+  at construction: non-empty, at most 8 points, finite values, positive
+  factors, and strictly increasing speeds. `MouseFilter::try_with_config()` and
+  `FilterChain::try_set_mouse_profile()` return `MouseConfigError`; the
+  non-fallible constructors log and fall back to flat. Velocity is converted
+  from normalized counts/µs to mm/s with the 1000-counts-per-inch scale, so a
+  curve's speed axis is physical.
+- Velocity uses a 128-entry tracker ring and a 16 ms sample window, so the
+  estimate spans roughly the same physical time at 125 Hz through 8 kHz. The
+  newest displacement is included in the estimate.
+- Custom points are evaluated by linear interpolation: speeds below the first
+  point use the first factor; speeds above the last point use the last factor.
+- `Context::config_snapshot()` / `FilterChain::config_snapshot()` expose the effective mouse DPI, speed, profile, debounce, scroll scale, button map, rotation, calibration, and filter order. DPI source and raw metadata string are not yet included.
 - Direct `MouseFilter` construction normalizes non-positive DPI values to the
   documented 1000 DPI fallback, and runtime `FilterChain::set_mouse_dpi()` ignores
   non-positive changes.
@@ -197,7 +207,7 @@ absolute touchpad calibration is tracked in `absolute-device-transforms.md`.
   mouse filter's velocity history; completion requires either documenting that
   as intentional or replacing it with a neutral/deferred policy.
 - [ ] Expose a user-facing jay config API for custom acceleration curves.
-- [ ] Define the accepted custom curve format, units, maximum number of points,
+- [x] Define the accepted custom curve format, units, maximum number of points,
   monotonic-speed validation, non-finite value rejection, duplicate speed
   behavior, and factor bounds.
 - [ ] Define whether custom acceleration curves are persisted and replayed on
@@ -262,12 +272,12 @@ absolute touchpad calibration is tracked in `absolute-device-transforms.md`.
 - [ ] Log the selected DPI for each pointer device and the source of that value.
 - [ ] Log invalid metadata with enough detail to identify the device and rejected
   string.
-- [ ] Provide a device-inspection path that reports:
-  - [ ] effective DPI.
+- [x] Provide a device-inspection path (`Context::config_snapshot`) that reports:
+  - [x] effective DPI.
   - [ ] DPI source.
   - [ ] raw metadata string, if available.
-  - [ ] current acceleration profile.
-  - [ ] current acceleration speed.
+  - [x] current acceleration profile.
+  - [x] current acceleration speed.
 - [ ] Avoid noisy repeated warnings for the same invalid metadata on every event.
 
 ### Coverage
@@ -305,6 +315,13 @@ absolute touchpad calibration is tracked in `absolute-device-transforms.md`.
   otherwise idle.
 - [x] Add a Criterion workload for parsing realistic `MOUSE_DPI` property strings,
   including selected entries, lists, sampling rates, and invalid values.
+- [x] Add deterministic coverage for custom-curve validation (empty, unordered,
+  non-finite, non-positive factor, more than 8 points) and physical mm/s units
+  (`custom_curve_validation_rejects_invalid_configurations`,
+  `custom_curve_speed_axis_is_physical_mm_per_second`).
+- [x] Add deterministic coverage that velocity includes the newest sample
+  (`velocity_estimate_includes_the_newest_movement_sample`) and that the
+  time-windowed tracker spans physical time rather than report count.
 - [x] Add a human-like Criterion workload for hotplug configuration replay: queue
   DPI, add a matching pointer, then process representative motion.
   - [x] Current Criterion coverage models the input-rs half of replay by applying

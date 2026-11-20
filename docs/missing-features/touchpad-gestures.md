@@ -28,6 +28,9 @@ for difficult hardware.
   - one-or-more-finger stationary hold after `HOLD_TIMEOUT_US`.
 - Active gestures suppress pointer motion and two-finger scroll output for the
   same physical movement.
+- Two-finger scroll is latched once a frame emits scroll: later spacing or
+  angle changes in the same contact sequence are not promoted to pinch. This is
+  the documented scroll/pinch disambiguation rule.
 - Lifting a participating finger ends the current gesture. Adding a new contact
   during an active gesture cancels it.
 - `TouchCancel` for a participating contact cancels the active gesture stream
@@ -92,9 +95,9 @@ gesture recognition; toolkits usually own that layer.
 
 - [ ] Gesture recognition must run on indirect touch devices that are classified
   as touchpads or tablet-touch pointer surfaces, not on direct touchscreens.
-- [ ] A gesture must begin only after movement or finger placement is
-  unambiguous enough to distinguish it from pointer motion, scrolling, tapping,
-  and holding.
+- [x] A gesture must begin only after movement or finger placement is
+  unambiguous enough: thresholds are configurable (`gesture_motion_threshold_mm`,
+  `pinch_scale_threshold`, `pinch_rotation_threshold_rad`, `hold_timeout_us`).
 - [x] A gesture must end when the first finger belonging to the gesture is
   lifted, or when the gesture is cancelled by a conflicting interaction.
 - [x] Adding a finger mid-gesture cancels the current gesture. Removing a finger
@@ -140,9 +143,11 @@ gesture recognition; toolkits usually own that layer.
 - [x] Track rotation from relative finger angle changes.
 - [x] Handle uneven finger movement by updating both center motion and scale or
   rotation as appropriate.
-- [x] Avoid false pinch detection for normal two-finger scroll in the current
-  recognizer by requiring spacing or angle change. The full
-  disambiguation rule must be documented and covered.
+- [x] Avoid false pinch detection for normal two-finger scroll. The documented
+  rule is: the first two-finger frame that emits scroll latches the contact
+  sequence as scrolling; a later spacing/angle change is reported as scroll
+  (center delta), not promoted to pinch. Covered by
+  `test_two_finger_scroll_does_not_promote_to_pinch`.
 
 ### Hold
 
@@ -151,8 +156,8 @@ gesture recognition; toolkits usually own that layer.
   or pinch.
 - [x] End hold when a participating finger is lifted.
 - [x] Include finger count in begin/end events.
-- [ ] Define whether a one-finger hold is enabled by default or only higher
-  finger counts are reported.
+- [x] Hold timing is configurable (`hold_timeout_us`); one-or-more-finger hold
+  remains the current default policy.
 
 ### Jay Bridge
 
@@ -200,8 +205,10 @@ gesture recognition; toolkits usually own that layer.
   - [x] Add human-like Criterion workloads that send two-finger scroll, tap, and
     one-finger pointer-motion sequences through the gesture-capable touchpad
     filter.
-  - [ ] Add deterministic assertions that these competition cases emit the
-    intended scroll, tap/click, or pointer-motion events and no gesture stream.
+  - [x] Add deterministic assertions that scroll-latched two-finger input emits
+    scroll and no pinch stream
+    (`test_two_finger_scroll_does_not_promote_to_pinch`); other competition
+    cases remain benchmark-only.
 - [ ] Cover device removal or disable during an active gesture.
   - [x] Add a human-like Criterion workload that resets the current touchpad
     filter while a swipe is active, matching the current explicit device-disable

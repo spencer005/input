@@ -6,9 +6,10 @@ edition = "2024"
 [dependencies]
 slotmap = "1.1"
 evdev = "0.13"
-rustix = { version = "0.38", features = ["event", "fs"] }
+rustix = { version = "1", features = ["event", "fs"] }
 bitvec = "1.0"
 thiserror = "2.0"
+libc = "0.2"
 tracing = "0.1"
 smallvec = { git = "https://github.com/fereidani/rust-smallvec", features = ["extract_if", "may_dangle", "std"] }
 
@@ -36,3 +37,5 @@ harness = false
 
 [features]
 default = []
+
+[workspace]

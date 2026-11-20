@@ -143,8 +143,9 @@ Tablet tool event support itself is tracked in `tablet-tool-and-pad.md`.
 
 - [x] Add per-device calibration matrix storage. The current matrix is stored by
   the per-device `AbsoluteTransformFilter` in the filter chain.
-- [ ] Add runtime `Context` methods to set, reset, and query calibration. Current
-  code can set/replace calibration; reset and query are still missing.
+- [x] Add runtime `Context` methods to set, reset, and query calibration
+  (`set_calibration_matrix`, `reset_calibration_matrix`,
+  `calibration_matrix`).
 - [x] Apply calibration to touchscreen coordinates before emitting compositor-
   visible touch events when this layer owns calibration.
 - [ ] Apply calibration to tablet absolute x/y where appropriate.
@@ -175,17 +176,20 @@ Tablet tool event support itself is tracked in `tablet-tool-and-pad.md`.
 
 ### Relative Rotation
 
-- [ ] Add relative-device rotation configuration if parity with libinput is
-  desired.
+- [x] Add relative-device rotation configuration.
   - [x] Add a human-like Criterion workload carrying pointer deltas shaped like a
     user moving a relative device while the logical display is rotated.
-  - [ ] Add actual rotation configuration with accepted angles, validation,
-    reset/query behavior, runtime update behavior, and per-device storage.
-- [ ] Rotate pointer motion deltas by the configured angle.
-- [ ] Define wheel behavior for rotations near 180 degrees.
-- [ ] Ensure unaccelerated deltas are either rotated or preserved according to
-  documented raw-input semantics.
-- [ ] Rotation must compose with acceleration in a defined order.
+  - [x] Add rotation configuration with accepted angles (`0..=359`), validation,
+    set/reset/query, runtime updates, and per-device `RelativeRotationFilter`
+    storage. `DeviceProfile::pointer.rotation_degrees` supplies a default.
+- [x] Rotate pointer motion deltas by the configured angle (clockwise in screen
+  coordinates).
+- [x] Define wheel behavior: scroll deltas are never rotated, matching libinput
+  and avoiding silent axis swaps.
+- [x] Ensure unaccelerated deltas are rotated with the accelerated deltas so raw
+  clients see the same orientation.
+- [x] Rotation composes with acceleration in a defined order: the filter is
+  installed after acceleration in the chain.
 
 ### Pressure Range
 
@@ -209,8 +213,8 @@ Tablet tool event support itself is tracked in `tablet-tool-and-pad.md`.
 - [ ] Cover identity calibration.
   - [x] Add a human-like Criterion workload for identity calibration through the
     current transform filter.
-  - [ ] Add deterministic assertions that identity preserves touch down/motion
-    coordinates exactly for representative axis ranges.
+  - [x] Add deterministic assertions that identity preserves touch down/motion
+    coordinates exactly (`identity_preserves_coordinates`).
 - [x] Add human-like Criterion workloads that exercise X-axis inversion, Y-axis
   inversion, and 90-degree clockwise/counter-clockwise rotation matrices through
   the current transform filter.
@@ -221,20 +225,23 @@ Tablet tool event support itself is tracked in `tablet-tool-and-pad.md`.
   - [x] Add human-like Criterion workloads for Y inversion and 90-degree
     clockwise/counter-clockwise rotation matrices through the current transform
     filter.
-  - [ ] Add deterministic assertions for translation, scale, X inversion, Y
-    inversion, and 90-degree rotation matrices.
+  - [x] Add deterministic assertions for translation/scale clamping, X
+    inversion, Y inversion, and 90-degree rotation matrices
+    (`x_and_y_inversion`, `ninety_degree_rotation`,
+    `out_of_range_results_are_clamped`).
 - [ ] Cover invalid matrix rejection.
   - [x] Add a Criterion workload with user-config-shaped calibration matrices
     containing `NaN`, positive infinity, and negative infinity values, plus one
     valid matrix for comparison, through `CalibrationMatrix::new()`.
-  - [ ] Add deterministic assertions that non-finite matrices are rejected and
-    do not alter an installed filter.
+  - [x] Add deterministic assertions that non-finite matrices are rejected
+    (`non_finite_matrix_is_rejected`); `FilterChain::set_calibration_matrix`
+    only installs validated matrices.
 - [ ] Cover coordinate clamping or dropping policy.
   - [x] Add a human-like Criterion workload for coordinates that clamp after the
     current normalized transform.
-  - [ ] Add deterministic assertions for min-bound and max-bound clamping, or
-    replace the current clamping behavior with a documented drop/pass-through
-    policy and cover that policy.
+  - [x] Add deterministic assertions for min-bound and max-bound clamping
+    (`out_of_range_results_are_clamped`). Clamping remains the documented
+    policy.
 - [ ] Cover calibration changes while active and neutral.
   - [x] Add human-like Criterion workloads for calibration replacement before a
     neutral sequence and during an active touch sequence.
@@ -249,9 +256,10 @@ Tablet tool event support itself is tracked in `tablet-tool-and-pad.md`.
 - [ ] Cover relative rotation at 90, 180, and arbitrary angles if supported.
   - [x] Add a human-like Criterion workload carrying relative motion that would
     need rotation to align with a rotated display.
-  - [ ] Add deterministic assertions for configured 90-degree, 180-degree, and
-    arbitrary-angle rotation, including both accelerated and unaccelerated delta
-    semantics.
+  - [x] Add deterministic assertions for 90-degree, 180-degree, and
+    arbitrary-angle rotation, including accelerated and unaccelerated deltas,
+    scroll pass-through, and invalid-angle rejection
+    (`processing::rotation::tests`).
 - [ ] Cover pressure range remapping.
   - [x] Tablet pressure-range-shaped event-model coverage exists in
     `feature_tablet_tool_and_pad/pressure_range_candidate_current_events`.

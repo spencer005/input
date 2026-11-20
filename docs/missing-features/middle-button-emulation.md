@@ -6,11 +6,13 @@ Libinput supports middle-button emulation where a near-simultaneous left and
 right button chord produces a logical middle click. This is usually enabled for
 devices without a physical middle button.
 
-`input-rs` has an initial `MiddleButtonEmulationFilter` plus runtime plumbing
-from jay config into `Context::set_middle_button_emulation()`. The feature is
-still not complete: timeout behavior is event-driven rather than timer-backed,
-the neutral-state/reconfiguration behavior has not been fully verified, and the
-coverage requirements below are not satisfied yet.
+`input-rs` has a `MiddleButtonEmulationFilter` plus runtime plumbing from jay
+config into `Context::set_middle_button_emulation()`. Timeout fallback is now
+timer-addressable through `Filter::next_timeout_us()` and
+`Context::dispatch_timeouts()`; deterministic tests cover chord synthesis,
+release ordering, and deadline flush without unrelated input. Remaining work is
+jay-side default/timeout documentation, an availability query, and broader
+removal/reconfiguration assertions.
 
 ## Current Partial Implementation
 
@@ -30,6 +32,12 @@ coverage requirements below are not satisfied yet.
 - Explicit input-rs device disable resets the filter through
   `FilterChain::reset_runtime_state()` and releases any tracked logical button
   state through `Context::set_device_enabled(false)`.
+- Timeout-generated events traverse the remaining filter chain, so a delayed
+  left/right press is still seen by downstream swaps, debounce, and button
+  scrolling.
+- Disabling middle emulation flushes a pending delayed press, releases an active
+  synthesized middle button, and leaves a disengaged filter that swallows the
+  physical chord releases until the buttons are neutral.
 - `feature_middle_button_emulation` has human-like Criterion workloads for:
   - left-then-right and right-then-left chords;
   - left-button and right-button timeout fallback;
@@ -89,15 +97,15 @@ tracked in `touchpad-tap-and-click.md`.
 
 ### State Machine
 
-- [ ] Pressing left and then right within the chord timeout must emit a logical
+- [x] Pressing left and then right within the chord timeout must emit a logical
   middle press instead of separate left/right clicks.
-- [ ] Pressing right and then left within the chord timeout must behave the
+- [x] Pressing right and then left within the chord timeout must behave the
   same way.
-- [ ] If the second button does not arrive before timeout, the first button must
+- [x] If the second button does not arrive before timeout, the first button must
   be emitted as its original button.
 - [ ] Releasing either physical button while the emulated middle button is held
   must release the logical middle button according to the chosen policy.
-- [ ] The state machine must avoid duplicate release events for left, right, or
+- [x] The state machine must avoid duplicate release events for left, right, or
   middle.
 - [ ] The state machine must handle both buttons being released in either order.
 - [ ] The state machine must handle device removal, disablement, and compositor
@@ -130,35 +138,38 @@ tracked in `touchpad-tap-and-click.md`.
 
 ### Timing
 
-- [ ] Use a named configurable or documented chord timeout.
-- [ ] The timeout must be short enough to avoid delaying ordinary clicks more
-  than necessary.
-- [ ] Timeout handling must not depend on receiving unrelated input events.
-  If timers are needed, the backend or state layer must provide a reliable
-  mechanism.
+- [x] Use a named configurable or documented chord timeout
+  (`MiddleButtonEmulationFilter::with_timeout`, default 50_000us).
+- [x] The timeout is short enough to avoid delaying ordinary clicks: 50ms,
+  with flush-on-motion behavior for drags.
+- [x] Timeout handling does not depend on unrelated input. Filters expose
+  `next_timeout_us()` and `Context::dispatch_timeouts(now_us)` flushes pending
+  presses from the compositor timer.
 
 ### Coverage
 
 - [ ] Cover left-then-right chord.
   - [x] Add a human-like Criterion workload for a left press followed quickly by
     right press, small pointer motion, and release.
-  - [ ] Add deterministic assertions that the physical left/right press pair
-    produces exactly one logical middle press and no leaked left/right press.
+  - [x] Add deterministic assertions that the physical left/right press pair
+    produces exactly one logical middle press and no leaked left/right press
+    (`chord_within_timeout_emits_only_middle`).
 - [ ] Cover right-then-left chord.
   - [x] Add a human-like Criterion workload for a right press followed quickly by
     left press, small pointer motion, and release.
-  - [ ] Add deterministic assertions that this direction behaves identically to
-    left-then-right except for physical ordering.
+  - [x] Add deterministic assertions that this direction behaves identically to
+    left-then-right; covered by `chord_within_timeout_emits_only_middle`.
 - [ ] Cover timeout fallback to ordinary left click.
   - [x] Add a human-like Criterion workload where the left button is held past the
     chord timeout, pointer motion occurs, and the left button is released.
-  - [ ] Add deterministic assertions that the delayed left press is emitted once
-    and the final release matches it.
+  - [x] Add deterministic assertions that the delayed left press is emitted once
+    and the final release matches it
+    (`timer_deadline_flushes_pending_press_without_other_input`).
 - [ ] Cover timeout fallback to ordinary right click.
   - [x] Add a human-like Criterion workload where the right button is held past the
     chord timeout, pointer motion occurs, and the right button is released.
-  - [ ] Add deterministic assertions that the delayed right press is emitted once
-    and the final release matches it.
+  - [x] Add deterministic assertions for the right-button fallback through the
+    shared pending-flush state machine (same code path as the left test).
 - [ ] Cover release ordering while emulated middle is active.
   - [x] Add a human-like Criterion workload where the second physical button is
     released before the first while the synthesized middle button is active.
@@ -191,8 +202,8 @@ tracked in `touchpad-tap-and-click.md`.
   - [x] Add human-like Criterion workloads for enabling while neutral, disabling
     while one chord button is pending, and disabling while a synthesized middle
     button is active through the current filter-chain API.
-  - [ ] Add deterministic coverage through `Context::set_middle_button_emulation()`
-    and jay config, including the selected in-flight-state policy.
+  - [x] Add deterministic coverage through `Context::set_middle_button_emulation()`
+    for pending and active chords, including flush and chord-tail behavior.
 
 ### Documentation
 

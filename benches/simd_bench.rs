@@ -141,7 +141,7 @@ fn bench_filterchain_overhead(c: &mut Criterion) {
     let mut mouse = MouseFilter::flat(1000);
     group.bench_function("direct_mouse_flat", |b| {
         b.iter(|| {
-            let result = mouse.process(black_box(event.clone()), None, None);
+            let result = mouse.run(black_box(event.clone()), None, None);
             black_box(&result);
         })
     });
@@ -187,7 +187,7 @@ fn bench_mouse_profiles(c: &mut Criterion) {
     group.bench_function("flat_1000dpi", |b| {
         let mut mouse = MouseFilter::flat(1000);
         b.iter(|| {
-            let result = mouse.process(black_box(event.clone()), None, None);
+            let result = mouse.run(black_box(event.clone()), None, None);
             black_box(&result);
         })
     });
@@ -195,7 +195,7 @@ fn bench_mouse_profiles(c: &mut Criterion) {
     group.bench_function("flat_400dpi", |b| {
         let mut mouse = MouseFilter::flat(400);
         b.iter(|| {
-            let result = mouse.process(black_box(event.clone()), None, None);
+            let result = mouse.run(black_box(event.clone()), None, None);
             black_box(&result);
         })
     });
@@ -203,7 +203,7 @@ fn bench_mouse_profiles(c: &mut Criterion) {
     group.bench_function("flat_35000dpi", |b| {
         let mut mouse = MouseFilter::flat(35_000);
         b.iter(|| {
-            let result = mouse.process(black_box(event.clone()), None, None);
+            let result = mouse.run(black_box(event.clone()), None, None);
             black_box(&result);
         })
     });
@@ -211,7 +211,7 @@ fn bench_mouse_profiles(c: &mut Criterion) {
     group.bench_function("adaptive_1000dpi", |b| {
         let mut mouse = MouseFilter::new(1000, 0.0);
         b.iter(|| {
-            let result = mouse.process(black_box(event.clone()), None, None);
+            let result = mouse.run(black_box(event.clone()), None, None);
             black_box(&result);
         })
     });
@@ -227,3 +227,52 @@ criterion_group!(
     bench_mouse_profiles,
 );
 criterion_main!(benches);
+
+trait ChainProcessExt {
+    fn process(
+        &mut self,
+        event: input_rs::events::InputEvent,
+        seat: Option<&input_rs::state::Seat>,
+        info: Option<&input_rs::backend::DeviceInfo>,
+    ) -> input_rs::processing::FilterResult;
+}
+
+impl ChainProcessExt for input_rs::processing::FilterChain {
+    fn process(
+        &mut self,
+        event: input_rs::events::InputEvent,
+        seat: Option<&input_rs::state::Seat>,
+        info: Option<&input_rs::backend::DeviceInfo>,
+    ) -> input_rs::processing::FilterResult {
+        let mut out = input_rs::processing::FilterResult::new();
+        self.process_into(event, seat, info, &mut out);
+        out
+    }
+}
+
+trait FilterRunExt {
+    fn run(
+        &mut self,
+        event: input_rs::events::InputEvent,
+        seat: Option<&input_rs::state::Seat>,
+        info: Option<&input_rs::backend::DeviceInfo>,
+    ) -> input_rs::processing::FilterResult;
+}
+
+impl<T: input_rs::processing::Filter> FilterRunExt for T {
+    fn run(
+        &mut self,
+        mut event: input_rs::events::InputEvent,
+        seat: Option<&input_rs::state::Seat>,
+        info: Option<&input_rs::backend::DeviceInfo>,
+    ) -> input_rs::processing::FilterResult {
+        use input_rs::processing::Step;
+        let mut out = input_rs::processing::FilterResult::new();
+        match input_rs::processing::Filter::process(self, &mut event, seat, info) {
+            Step::Keep => out.push(event),
+            Step::Suppress => {}
+            Step::FanOut(events) => out.extend(*events),
+        }
+        out
+    }
+}

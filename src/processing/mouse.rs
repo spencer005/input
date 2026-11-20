@@ -1,11 +1,61 @@
 use {
-    super::{Filter, FilterResult},
+    super::{Filter, Step},
     crate::{backend::DeviceInfo, events::InputEvent, state::Seat},
-    smallvec::{SmallVec, smallvec},
+    smallvec::SmallVec,
 };
 
 const MOTION_TIMEOUT: u64 = 1_000_000;
 const MAX_VELOCITY_DIFF: f64 = 0.001; // units/us
+
+/// Velocity is estimated from samples in this time window, independent of the
+/// device polling rate (up to 8 kHz with the 128-entry ring).
+const VELOCITY_WINDOW_US: u64 = 16_000;
+const TRACKER_SAMPLES: usize = 128;
+const TRACKER_MASK: usize = TRACKER_SAMPLES - 1;
+
+/// Normalized counts per inch used by the DPI normalization layer.
+const NORMALIZED_COUNTS_PER_INCH: f64 = 1000.0;
+/// Conversion from normalized counts/µs to mm/s at 1000 counts per inch.
+const MM_PER_SECOND_PER_COUNT_PER_US: f64 = 25.4 / NORMALIZED_COUNTS_PER_INCH * 1_000_000.0;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MouseConfigError {
+    EmptyCustomCurve,
+    NonFiniteCustomPoint { index: usize },
+    NonPositiveCustomFactor { index: usize },
+    NonMonotonicCustomSpeed { index: usize },
+    MoreThanEightCustomPoints,
+}
+
+impl std::fmt::Display for MouseConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MouseConfigError::EmptyCustomCurve => {
+                f.write_str("custom acceleration curve has no points")
+            }
+            MouseConfigError::NonFiniteCustomPoint { index } => {
+                write!(f, "custom acceleration point {index} is not finite")
+            }
+            MouseConfigError::NonPositiveCustomFactor { index } => {
+                write!(
+                    f,
+                    "custom acceleration point {index} has a non-positive factor"
+                )
+            }
+            MouseConfigError::NonMonotonicCustomSpeed { index } => {
+                write!(
+                    f,
+                    "custom acceleration speed {index} is not strictly increasing"
+                )
+            }
+            MouseConfigError::MoreThanEightCustomPoints => {
+                f.write_str("custom acceleration curve has more than 8 points")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MouseConfigError {}
 
 /// Configuration for mouse acceleration profile.
 ///
@@ -53,6 +103,41 @@ impl Default for MouseConfig {
 }
 
 impl MouseConfig {
+    /// Validate the configuration, especially custom acceleration curves.
+    ///
+    /// Custom points are `(speed_mm_per_s, factor)` and must be finite, have a
+    /// positive factor, and use strictly increasing speeds.
+    pub fn validate(&self) -> Result<(), MouseConfigError> {
+        let MouseAccelProfile::Custom(points) = &self.profile else {
+            return Ok(());
+        };
+
+        if points.is_empty() {
+            return Err(MouseConfigError::EmptyCustomCurve);
+        }
+        if points.len() > 8 {
+            return Err(MouseConfigError::MoreThanEightCustomPoints);
+        }
+
+        for (index, (speed, factor)) in points.iter().enumerate() {
+            if !speed.is_finite() || !factor.is_finite() || *speed < 0.0 {
+                return Err(MouseConfigError::NonFiniteCustomPoint { index });
+            }
+            if *factor <= 0.0 {
+                return Err(MouseConfigError::NonPositiveCustomFactor { index });
+            }
+            if index > 0 && *speed <= points[index - 1].0 {
+                return Err(MouseConfigError::NonMonotonicCustomSpeed { index });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validated(self) -> Result<Self, MouseConfigError> {
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Create a flat (no-acceleration) config for the given DPI.
     pub fn flat(dpi: i32) -> Self {
         Self {
@@ -138,7 +223,7 @@ struct Tracker {
 }
 
 pub struct MouseFilter {
-    trackers: [Tracker; 16],
+    trackers: [Tracker; TRACKER_SAMPLES],
     cur_tracker: usize,
     last_velocity: f64,
     last_accel_factor: f64,
@@ -169,7 +254,34 @@ impl MouseFilter {
         Self::with_config(MouseConfig::flat(dpi))
     }
 
+    /// Construct a filter, rejecting an invalid custom acceleration curve.
+    pub fn try_with_config(config: MouseConfig) -> Result<Self, MouseConfigError> {
+        config.validate()?;
+        Ok(Self::from_validated_config(config))
+    }
+
+    /// Construct a filter from configuration.
+    ///
+    /// Invalid custom curves are rejected with a diagnostic and fall back to
+    /// the flat profile. Use [`MouseFilter::try_with_config`] when the caller
+    /// wants the validation error.
     pub fn with_config(config: MouseConfig) -> Self {
+        match config.validate() {
+            Ok(()) => Self::from_validated_config(config),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "input-rs: invalid mouse acceleration curve; using flat profile"
+                );
+                Self::from_validated_config(MouseConfig {
+                    profile: MouseAccelProfile::Flat,
+                    ..config
+                })
+            }
+        }
+    }
+
+    fn from_validated_config(config: MouseConfig) -> Self {
         let dpi = normalize_dpi(config.dpi);
         let dpi_factor = 1000.0 / dpi as f64;
         let speed_adjustment = normalize_speed_adjustment(config.speed_adjustment);
@@ -185,7 +297,7 @@ impl MouseFilter {
         let incline = 1.1 + speed_adjustment * 0.75;
 
         let mut f = Self {
-            trackers: [Tracker::default(); 16],
+            trackers: [Tracker::default(); TRACKER_SAMPLES],
             cur_tracker: 0,
             last_velocity: 0.0,
             last_accel_factor: 1.0,
@@ -207,26 +319,38 @@ impl MouseFilter {
         let cur = self.cur_tracker;
         let mut dx = 0.0;
         let mut dy = 0.0;
+        let mut accepted = 0usize;
 
-        for offset in 1..16 {
-            let index = (cur + 16 - offset) & 15;
+        for offset in 1..TRACKER_SAMPLES {
+            let index = (cur + TRACKER_SAMPLES - offset) & TRACKER_MASK;
             let tracker = &self.trackers[index];
 
             if tracker.time == 0 || tracker.time > time {
                 break;
             }
-            if offset > 1 {
-                let delta_index = (cur + 16 - offset + 1) & 15;
-                let delta = &self.trackers[delta_index];
-                dx += delta.dx;
-                dy += delta.dy;
-            }
 
-            let tdelta = time.saturating_sub(tracker.time) + 1;
-            if tdelta > MOTION_TIMEOUT {
+            let age = time.saturating_sub(tracker.time);
+            if age > MOTION_TIMEOUT {
                 break;
             }
 
+            // Normally stop at the time window. Low-polling-rate devices may
+            // have only one sample inside it; accept that first interval before
+            // applying the window limit so velocity does not collapse to zero.
+            if age > VELOCITY_WINDOW_US && accepted > 0 {
+                break;
+            }
+
+            // The tracker at `index` is older than the newest sample; add the
+            // displacement of the sample immediately newer than it so the
+            // velocity for the newest movement is not dropped.
+            let delta_index = (cur + TRACKER_SAMPLES - offset + 1) & TRACKER_MASK;
+            let delta = &self.trackers[delta_index];
+            dx += delta.dx;
+            dy += delta.dy;
+            accepted += 1;
+
+            let tdelta = age + 1;
             let velocity = (dx * dx + dy * dy).sqrt() / tdelta as f64;
 
             if initial_velocity == 0.0 || offset <= 2 {
@@ -270,18 +394,15 @@ impl MouseFilter {
                 factor.min(self.accel)
             }
             MouseAccelProfile::Custom(points) => {
-                // Piecewise-linear interpolation over (speed_mm_per_s, factor) points.
-                // Speed values are in mm/s (velocity * 1000 converts from units/us to mm/s).
-                let speed = velocity * 1000.0;
-                if !speed.is_finite() || points.is_empty() {
+                // Piecewise-linear interpolation over (speed_mm_per_s, factor)
+                // points. Trackers store normalized counts/µs, so convert to
+                // physical mm/s before selecting a curve point.
+                let speed = velocity * MM_PER_SECOND_PER_COUNT_PER_US;
+                if !speed.is_finite() {
                     return 1.0;
                 }
-                if points
-                    .iter()
-                    .any(|(point_speed, factor)| !point_speed.is_finite() || !factor.is_finite())
-                {
-                    return 1.0;
-                }
+                // The curve was validated at construction; the hot path only
+                // performs the lookup/interpolation.
                 // Below first point: use its factor
                 if speed <= points[0].0 {
                     return points[0].1;
@@ -319,7 +440,7 @@ impl MouseFilter {
     }
 
     pub fn reset_runtime_state(&mut self) {
-        self.trackers = [Tracker::default(); 16];
+        self.trackers = [Tracker::default(); TRACKER_SAMPLES];
         self.cur_tracker = 0;
         self.last_velocity = 0.0;
         self.last_accel_factor = self.accel_profile(0.0);
@@ -337,98 +458,74 @@ fn normalize_speed_adjustment(speed: f64) -> f64 {
 impl Filter for MouseFilter {
     fn process(
         &mut self,
-        event: InputEvent,
+        event: &mut InputEvent,
         _seat: Option<&Seat>,
-        _info: Option<DeviceInfo>,
-    ) -> FilterResult {
-        match event {
-            InputEvent::PointerMotion {
-                device_index,
-                time_us,
-                dx,
-                dy,
-                dx_unaccelerated: _,
-                dy_unaccelerated: _,
-            } => {
-                let norm_dx = dx * self.dpi_factor;
-                let norm_dy = dy * self.dpi_factor;
-                if !norm_dx.is_finite() || !norm_dy.is_finite() {
-                    self.reset_runtime_state();
-                    return smallvec![];
-                }
-
-                // Flat profile fast path: skip velocity tracking and acceleration.
-                // Only DPI normalization + constant factor needed. No velocity
-                // tracking required for the flat profile since accel is speed-independent.
-                if self.profile == MouseAccelProfile::Flat {
-                    let factor = self.accel_profile(0.0);
-                    let out_dx = norm_dx * factor;
-                    let out_dy = norm_dy * factor;
-                    if !out_dx.is_finite() || !out_dy.is_finite() {
-                        self.reset_runtime_state();
-                        return smallvec![];
-                    }
-                    return smallvec![InputEvent::PointerMotion {
-                        device_index,
-                        time_us,
-                        dx: out_dx,
-                        dy: out_dy,
-                        dx_unaccelerated: norm_dx,
-                        dy_unaccelerated: norm_dy,
-                    }];
-                }
-
-                self.cur_tracker = (self.cur_tracker + 1) & 15;
-                self.trackers[self.cur_tracker] = Tracker {
-                    dx: norm_dx,
-                    dy: norm_dy,
-                    time: time_us,
-                };
-
-                let velocity = self.calculate_velocity(time_us);
-
-                let current_accel_factor = self.accel_profile(velocity);
-                let mid_accel_factor = self.accel_profile((self.last_velocity + velocity) * 0.5);
-
-                // Simpson's rule for smooth acceleration transitions
-                let accel_factor =
-                    (current_accel_factor + self.last_accel_factor + 4.0 * mid_accel_factor)
-                        * (1.0 / 6.0);
-                if !accel_factor.is_finite() {
-                    self.reset_runtime_state();
-                    return smallvec![];
-                }
-
-                self.last_velocity = velocity;
-                self.last_accel_factor = current_accel_factor;
-                let out_dx = norm_dx * accel_factor;
-                let out_dy = norm_dy * accel_factor;
-                if !out_dx.is_finite() || !out_dy.is_finite() {
-                    self.reset_runtime_state();
-                    return smallvec![];
-                }
-
-                smallvec![InputEvent::PointerMotion {
-                    device_index,
-                    time_us,
-                    dx: out_dx,
-                    dy: out_dy,
-                    dx_unaccelerated: norm_dx,
-                    dy_unaccelerated: norm_dy,
-                }]
-            }
-            InputEvent::DeviceRemoved { .. } => {
+        _info: Option<&DeviceInfo>,
+    ) -> Step {
+        let time_us = event.time_us();
+        let InputEvent::PointerMotion {
+            dx,
+            dy,
+            dx_unaccelerated,
+            dy_unaccelerated,
+            ..
+        } = event
+        else {
+            if matches!(event, InputEvent::DeviceRemoved { .. }) {
                 self.reset_runtime_state();
-                smallvec![event]
             }
-            _ => smallvec![event],
+            return Step::Keep;
+        };
+
+        let norm_dx = *dx * self.dpi_factor;
+        let norm_dy = *dy * self.dpi_factor;
+        if !norm_dx.is_finite() || !norm_dy.is_finite() {
+            self.reset_runtime_state();
+            return Step::Suppress;
         }
+
+        let (out_dx, out_dy) = if self.profile == MouseAccelProfile::Flat {
+            let factor = self.accel_profile(0.0);
+            (norm_dx * factor, norm_dy * factor)
+        } else {
+            self.cur_tracker = (self.cur_tracker + 1) & TRACKER_MASK;
+            self.trackers[self.cur_tracker] = Tracker {
+                dx: norm_dx,
+                dy: norm_dy,
+                time: time_us,
+            };
+
+            let velocity = self.calculate_velocity(time_us);
+            let current_accel_factor = self.accel_profile(velocity);
+            let mid_accel_factor = self.accel_profile((self.last_velocity + velocity) * 0.5);
+            let accel_factor =
+                (current_accel_factor + self.last_accel_factor + 4.0 * mid_accel_factor)
+                    * (1.0 / 6.0);
+            if !accel_factor.is_finite() {
+                self.reset_runtime_state();
+                return Step::Suppress;
+            }
+            self.last_velocity = velocity;
+            self.last_accel_factor = current_accel_factor;
+            (norm_dx * accel_factor, norm_dy * accel_factor)
+        };
+
+        if !out_dx.is_finite() || !out_dy.is_finite() {
+            self.reset_runtime_state();
+            return Step::Suppress;
+        }
+
+        *dx = out_dx;
+        *dy = out_dy;
+        *dx_unaccelerated = norm_dx;
+        *dy_unaccelerated = norm_dy;
+        Step::Keep
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, crate::processing::TestFilterExt};
 
     #[test]
     fn test_parse_mouse_dpi_property() {
@@ -483,7 +580,7 @@ mod tests {
         let dev = crate::events::DevIndex(0);
 
         // With dpi_factor = 1000/1000 = 1.0, output should equal input
-        let result = filter.process(
+        let result = filter.run(
             InputEvent::PointerMotion {
                 device_index: dev,
                 time_us: 1000,
@@ -520,7 +617,7 @@ mod tests {
 
         // With dpi_factor = 1000/400 = 2.5, output should be input * 2.5
         let mut filter_400 = MouseFilter::flat(400);
-        let result = filter_400.process(
+        let result = filter_400.run(
             InputEvent::PointerMotion {
                 device_index: dev,
                 time_us: 1000,
@@ -560,7 +657,7 @@ mod tests {
         let mut filter = MouseFilter::flat(1000);
         let dev = crate::events::DevIndex(0);
 
-        let result = filter.process(
+        let result = filter.run(
             InputEvent::Key {
                 device_index: dev,
                 time_us: 1000,
@@ -587,7 +684,7 @@ mod tests {
             profile: MouseAccelProfile::Flat,
         });
         let dev = crate::events::DevIndex(0);
-        let result = filter_slow.process(
+        let result = filter_slow.run(
             InputEvent::PointerMotion {
                 device_index: dev,
                 time_us: 1000,
@@ -631,7 +728,7 @@ mod tests {
             speed_adjustment: 0.5,
             profile: MouseAccelProfile::Flat,
         });
-        let result = filter_fast.process(
+        let result = filter_fast.run(
             InputEvent::PointerMotion {
                 device_index: dev,
                 time_us: 2000,
@@ -660,6 +757,160 @@ mod tests {
     }
 
     #[test]
+    fn velocity_is_stable_across_polling_rates() {
+        fn build(samples: usize, step_us: u64) -> MouseFilter {
+            let mut filter = MouseFilter::new(1000, 0.0);
+            let delta = step_us as f64 / 1000.0; // same physical speed
+            for index in 0..samples {
+                filter.trackers[index] = Tracker {
+                    dx: delta,
+                    dy: 0.0,
+                    time: 1_000 + index as u64 * step_us,
+                };
+            }
+            filter.cur_tracker = samples - 1;
+            filter
+        }
+
+        let low = build(16, 1_000); // 1 kHz, 15 ms
+        let high = build(128, 125); // 8 kHz, ~15.9 ms
+        let low_velocity = low.calculate_velocity(1_000 + 15 * 1_000);
+        let high_velocity = high.calculate_velocity(1_000 + 127 * 125);
+
+        let relative = (low_velocity - high_velocity).abs() / low_velocity.max(1e-12);
+        assert!(low_velocity > 0.0);
+        assert!(
+            relative < 0.01,
+            "velocity should be polling-rate independent: low={low_velocity}, high={high_velocity}"
+        );
+    }
+
+    #[test]
+    fn low_polling_rate_still_produces_a_velocity() {
+        let mut filter = MouseFilter::new(1000, 0.0);
+        // 30 Hz polling: the previous sample is older than the 16 ms window,
+        // but one interval must still be accepted.
+        filter.trackers[0] = Tracker {
+            dx: 0.0,
+            dy: 0.0,
+            time: 1_000,
+        };
+        filter.trackers[1] = Tracker {
+            dx: 3.0,
+            dy: 4.0,
+            time: 34_000,
+        };
+        filter.cur_tracker = 1;
+
+        let velocity = filter.calculate_velocity(34_000);
+        assert!(velocity > 0.0);
+        assert!((velocity - 5.0 / 33_001.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn velocity_estimate_includes_the_newest_movement_sample() {
+        let mut filter = MouseFilter::new(1000, 0.0);
+        // Two samples: 1 normalized count at t=1ms and 1 at t=2ms.
+        filter.trackers[0] = Tracker {
+            dx: 1.0,
+            dy: 0.0,
+            time: 1_000,
+        };
+        filter.trackers[1] = Tracker {
+            dx: 1.0,
+            dy: 0.0,
+            time: 2_000,
+        };
+        filter.cur_tracker = 1;
+
+        let velocity = filter.calculate_velocity(2_000);
+        assert!(
+            velocity > 0.0,
+            "velocity must include the newest sample's displacement"
+        );
+        assert!((velocity - 1.0 / 1_001.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn custom_curve_validation_rejects_invalid_configurations() {
+        use smallvec::smallvec;
+
+        let base = MouseConfig {
+            dpi: 1000,
+            speed_adjustment: 0.0,
+            profile: MouseAccelProfile::Custom(smallvec![]),
+        };
+        assert_eq!(base.validate(), Err(MouseConfigError::EmptyCustomCurve));
+
+        let unordered = MouseConfig {
+            profile: MouseAccelProfile::Custom(smallvec![(10.0, 1.0), (5.0, 2.0)]),
+            ..base.clone()
+        };
+        assert_eq!(
+            unordered.validate(),
+            Err(MouseConfigError::NonMonotonicCustomSpeed { index: 1 })
+        );
+
+        let negative_factor = MouseConfig {
+            profile: MouseAccelProfile::Custom(smallvec![(0.0, 1.0), (10.0, -1.0)]),
+            ..base.clone()
+        };
+        assert_eq!(
+            negative_factor.validate(),
+            Err(MouseConfigError::NonPositiveCustomFactor { index: 1 })
+        );
+
+        let non_finite = MouseConfig {
+            profile: MouseAccelProfile::Custom(smallvec![(0.0, 1.0), (f64::NAN, 2.0)]),
+            ..base
+        };
+        assert_eq!(
+            non_finite.validate(),
+            Err(MouseConfigError::NonFiniteCustomPoint { index: 1 })
+        );
+    }
+
+    #[test]
+    fn custom_curve_speed_axis_is_physical_mm_per_second() {
+        use smallvec::smallvec;
+
+        // Velocity is measured in normalized counts/µs. At 1000 counts/inch,
+        // 0.01 counts/µs is 254 mm/s, which must land on the curve point.
+        let config = MouseConfig {
+            dpi: 1000,
+            speed_adjustment: 0.0,
+            profile: MouseAccelProfile::Custom(smallvec![(0.0, 1.0), (254.0, 3.0)]),
+        };
+        let filter = MouseFilter::try_with_config(config).unwrap();
+        assert!((filter.accel_profile(0.01) - 3.0).abs() < 1e-12);
+        assert!((filter.accel_profile(0.0) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn invalid_custom_curve_falls_back_without_panicking() {
+        use smallvec::smallvec;
+
+        let mut filter = MouseFilter::with_config(MouseConfig {
+            dpi: 1000,
+            speed_adjustment: 0.0,
+            profile: MouseAccelProfile::Custom(smallvec![(10.0, 1.0), (5.0, 2.0)]),
+        });
+        let result = filter.run(
+            InputEvent::PointerMotion {
+                device_index: crate::events::DevIndex(0),
+                time_us: 1000,
+                dx: 5.0,
+                dy: 5.0,
+                dx_unaccelerated: 5.0,
+                dy_unaccelerated: 5.0,
+            },
+            None,
+            None,
+        );
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
     fn test_custom_profile_piecewise_linear() {
         use smallvec::smallvec;
 
@@ -676,7 +927,7 @@ mod tests {
         let dev = crate::events::DevIndex(0);
 
         // At very low speed, expect factor close to 0.5 (first point)
-        let result = filter.process(
+        let result = filter.run(
             InputEvent::PointerMotion {
                 device_index: dev,
                 time_us: 1000,
@@ -699,7 +950,7 @@ mod tests {
 
         // Feed several fast motions to push past the threshold so acceleration kicks in
         for i in 0..20 {
-            let result = filter.process(
+            let result = filter.run(
                 InputEvent::PointerMotion {
                     device_index: dev,
                     time_us: 1000 + i as u64 * 1000,

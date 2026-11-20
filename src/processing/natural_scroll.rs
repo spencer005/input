@@ -1,7 +1,6 @@
 use {
-    super::{Filter, FilterResult},
+    super::{Filter, Step},
     crate::{backend::DeviceInfo, events::InputEvent, state::Seat},
-    smallvec::smallvec,
 };
 
 /// Inverts scroll direction for natural/reverse scrolling.
@@ -20,36 +19,25 @@ impl NaturalScrollFilter {
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
 }
 
 impl Filter for NaturalScrollFilter {
     fn process(
         &mut self,
-        event: InputEvent,
+        event: &mut InputEvent,
         _seat: Option<&Seat>,
-        _info: Option<DeviceInfo>,
-    ) -> FilterResult {
-        if !self.enabled {
-            return smallvec![event];
-        }
-
-        match event {
-            InputEvent::PointerScroll {
-                device_index,
-                time_us,
-                source,
-                dx,
-                dy,
-            } => {
-                smallvec![InputEvent::PointerScroll {
-                    device_index,
-                    time_us,
-                    source,
-                    dx: -dx,
-                    dy: -dy,
-                }]
+        _info: Option<&DeviceInfo>,
+    ) -> Step {
+        if self.enabled {
+            if let InputEvent::PointerScroll { dx, dy, .. } = event {
+                *dx = -*dx;
+                *dy = -*dy;
             }
-            _ => smallvec![event],
         }
+        Step::Keep
     }
 }
